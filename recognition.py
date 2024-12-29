@@ -52,9 +52,23 @@ def is_face_clear(image, top, right, bottom, left):
     high_pass = gray - cv2.GaussianBlur(gray, (5, 5), 10)
     high_pass_variance = np.var(high_pass)
 
+    # Анализ боке: Частотный спектр
+    fft = np.fft.fft2(gray)
+    fft_magnitude = np.abs(np.fft.fftshift(fft))
+    high_freq_mean = np.mean(fft_magnitude[fft_magnitude > np.percentile(fft_magnitude, 95)])
+
     # Комбинированный критерий
-    if laplacian_var < 30 or gradient_mean < 20 or high_pass_variance < 10:
-        logger.debug(f"Недостаточная резкость: Laplacian={laplacian_var:.2f}, Gradient={gradient_mean:.2f}, HighPass={high_pass_variance:.2f}")
+    if (
+        laplacian_var < 100 or  # Строгий порог для размытия
+        gradient_mean < 70 or 
+        high_pass_variance < 50 or
+        high_freq_mean < 200  # Дополнительная проверка на глубокое боке
+    ):
+        logger.debug(
+            f"Недостаточная резкость: Laplacian={laplacian_var:.2f}, "
+            f"Gradient={gradient_mean:.2f}, HighPass={high_pass_variance:.2f}, "
+            f"FFT_HighFreq={high_freq_mean:.2f}"
+        )
         return False
 
     return True
