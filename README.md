@@ -10,23 +10,23 @@ This project identifies faces in photos and copies matching photos from the `@al
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.13+
 - Virtual environment (`.venv`)
-- Libraries: `face_recognition`, `opencv-python`, `dlib`
+- Libraries: `face_recognition`, `opencv-python`, `dlib`, etc...
 
 ## Setup Instructions
 
 ### Step 1: Clone the Project
 
 ```bash
-git clone <repository_url>
+git clone https://github.com/pavelveter/recognition.git
 cd recognition
 ```
 
 ### Step 2: Create a Virtual Environment
 
 ```bash
-python3 -m venv .venv
+uv venv
 source .venv/bin/activate  # For macOS/Linux
 .venv\Scripts\activate   # For Windows
 ```
@@ -34,7 +34,7 @@ source .venv/bin/activate  # For macOS/Linux
 ### Step 3: Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 ### Step 4: Run the Program
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 Place the `images` folder in the project root directory and execute:
 
 ```bash
-python face_matching.py
+uv run recognition.py
 ```
 
 ### Step 5: Deactivate Virtual Environment
@@ -53,22 +53,10 @@ After running the script, deactivate the virtual environment:
 deactivate
 ```
 
-## Project Structure
-
-```
-face_matching_project/
-│
-├── .venv/                 # Virtual environment
-├── face_matching.py      # Main script
-├── requirements.txt      # Dependencies
-└── README.md             # Documentation
-```
-
 ## Notes
 
 - Ensure all photos are in JPEG format.
 - Place the `images` folder in the project root directory before running the script.
-- Install `dlib` dependencies if installation fails. Refer to [dlib documentation](http://dlib.net/).
 
 ## License
 
