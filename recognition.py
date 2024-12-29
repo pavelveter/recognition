@@ -7,12 +7,31 @@ import numpy as np
 from multiprocessing import Pool, cpu_count
 import time
 import cv2
+from skimage.feature import local_binary_pattern
+import configparser
 
 # Настроим логгирование
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger()
 
-def resize_image(image, max_size=(1000, 1000)):
+# Чтение конфигурации
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+# Извлечение значений из конфигурации
+max_size = tuple(map(int, config.get('settings', 'max_size').split(',')))
+laplacian_threshold = config.getint('settings', 'laplacian_threshold')
+gradient_threshold = config.getint('settings', 'gradient_threshold')
+high_pass_threshold = config.getint('settings', 'high_pass_threshold')
+high_freq_threshold = config.getint('settings', 'high_freq_threshold')
+lbp_threshold = config.getint('settings', 'lbp_threshold')
+threshold = config.getfloat('settings', 'threshold')
+resize = config.getboolean('settings', 'resize')
+images_folder = config.get('paths', 'images_folder')
+all_photos_folder = config.get('paths', 'all_photos')
+
+
+def resize_image(image, max_size=max_size):
     """Ресайзит изображение, сохраняя пропорции."""
     height, width = image.shape[:2]
     max_height, max_width = max_size
@@ -26,6 +45,7 @@ def resize_image(image, max_size=(1000, 1000)):
         return resized_image
     return image
 
+
 def is_face_clear(image, top, right, bottom, left):
     """Проверяет, является ли лицо четким (без боке или размытия)."""
     face = image[top:bottom, left:right]
@@ -37,7 +57,7 @@ def is_face_clear(image, top, right, bottom, left):
         return False
 
     # Преобразуем в оттенки серого
-    gray = face if face.ndim == 2 else face.mean(axis=2)
+    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
 
     # Резкость: Лапласиан
     laplacian_var = np.var(cv2.Laplacian(gray, cv2.CV_64F))
@@ -57,21 +77,27 @@ def is_face_clear(image, top, right, bottom, left):
     fft_magnitude = np.abs(np.fft.fftshift(fft))
     high_freq_mean = np.mean(fft_magnitude[fft_magnitude > np.percentile(fft_magnitude, 95)])
 
-    # Комбинированный критерий
-    if (
-        laplacian_var < 100 or  # Строгий порог для размытия
-        gradient_mean < 70 or 
-        high_pass_variance < 50 or
-        high_freq_mean < 200  # Дополнительная проверка на глубокое боке
-    ):
+    # Оценка текстуры: Локальные бинарные паттерны (LBP)
+    radius = 1
+    n_points = 8 * radius
+    lbp = local_binary_pattern(gray.astype(np.uint8), n_points, radius, method="uniform")
+    lbp_mean = np.mean(lbp)
+
+    # Применяем все критерии с учетом порогов
+    if (laplacian_var < laplacian_threshold or 
+        gradient_mean < gradient_threshold or 
+        high_pass_variance < high_pass_threshold or 
+        high_freq_mean < high_freq_threshold or
+        lbp_mean > lbp_threshold):
         logger.debug(
             f"Недостаточная резкость: Laplacian={laplacian_var:.2f}, "
             f"Gradient={gradient_mean:.2f}, HighPass={high_pass_variance:.2f}, "
-            f"FFT_HighFreq={high_freq_mean:.2f}"
+            f"FFT_HighFreq={high_freq_mean:.2f}, LBP={lbp_mean:.2f}"
         )
         return False
 
     return True
+
 
 def get_face_encoding(image_path, check_quality=False, resize=False):
     """Получает эмбеддинг лиц с изображения, опционально фильтруя по качеству и ресайзом."""
@@ -107,11 +133,13 @@ def get_face_encoding(image_path, check_quality=False, resize=False):
     logger.info(f"Сохранён кеш: {cache_path} (лиц найдено: {len(face_encodings)})")
     return face_encodings
 
+
 def find_selfie_files(folder_path):
     """Находит все файлы _SELFIE* в папке."""
     selfies = [f for f in os.listdir(folder_path) if f.startswith("_SELFIE") and f.endswith(".jpg")]
     selfies.sort(key=lambda x: datetime.strptime(f"{x.split('_')[3]}_{x.split('_')[4]}", "%y%m%d_%H%M%S"))
     return selfies
+
 
 def match_photo(photo_path, selfie_encodings, threshold, resize=False):
     """Сравнивает лицо на фотографии с эмбеддингами селфи."""
@@ -122,7 +150,8 @@ def match_photo(photo_path, selfie_encodings, threshold, resize=False):
             return photo_path
     return None
 
-def find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold=0.52, resize=False):
+
+def find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold=threshold, resize=resize):
     """Находит совпадения фотографий с использованием параллельной обработки."""
     photo_paths = [os.path.join(all_photos_folder, f) for f in os.listdir(all_photos_folder) if f.endswith('.jpg')]
 
@@ -133,11 +162,13 @@ def find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold=
     logger.info(f"Найдено совпадений: {len(matching_photos)}")
     return matching_photos
 
+
 def copy_photos_to_selfie_folder(matching_photos, target_folder):
     """Копирует фотографии в папку с _SELFIE*."""
     for photo in matching_photos:
         shutil.copy(photo, target_folder)
         logger.info(f"Скопировано: {photo} -> {target_folder}")
+
 
 def process_selfie_files(folder_path, all_photos_folder, threshold, resize=False):
     """Обрабатывает все _SELFIE* файлы в папке."""
@@ -177,12 +208,9 @@ def process_selfie_files(folder_path, all_photos_folder, threshold, resize=False
     
     return selfie_count, total_copied, found_faces
 
+
 def main():
     start_time = time.time()
-
-    images_folder = 'images'
-    all_photos_folder = os.path.join(images_folder, '@all_photos')
-    threshold = 0.52  # Пороговое значение для сравнения
 
     # Информация в начале
     selfie_folders = [f for f in os.listdir(images_folder) if os.path.isdir(os.path.join(images_folder, f)) and f != '@all_photos']
@@ -201,7 +229,7 @@ def main():
         logger.info(f"Обрабатываю папку: {folder_path}")
         
         # Обрабатываем все _SELFIE* файлы в текущей папке
-        selfie_count, copied_count, found_faces = process_selfie_files(folder_path, all_photos_folder, threshold, resize=True)
+        selfie_count, copied_count, found_faces = process_selfie_files(folder_path, all_photos_folder, threshold, resize=resize)
         total_selfies += selfie_count
         total_copied_photos += copied_count
 
@@ -216,8 +244,7 @@ def main():
     logger.info(f"Обработано селфи: {total_selfies}")
     logger.info(f"Скопировано файлов: {total_copied_photos}")
     logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
-    logger.info(f"Время выполнения: {elapsed_time:.2f} секунд")
-
+    logger.info(f"Время выполнения: {elapsed_time:.2f} секунд.")
 
 if __name__ == "__main__":
     main()

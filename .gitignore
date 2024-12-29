@@ -1,4 +1,3 @@
-images*/*
-images*/
+images*
 .venv
 *.npy
