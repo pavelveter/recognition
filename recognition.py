@@ -6,30 +6,92 @@ import logging
 import numpy as np
 from multiprocessing import Pool, cpu_count
 import time
+import cv2
 
 # Настроим логгирование
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger()
 
-def get_face_encoding(image_path):
-    """Получает эмбеддинг лиц с изображения и сохраняет его в кеш."""
+def resize_image(image, max_size=(1000, 1000)):
+    """Ресайзит изображение, сохраняя пропорции."""
+    height, width = image.shape[:2]
+    max_height, max_width = max_size
+
+    # Вычисляем пропорции
+    scale = min(max_height / height, max_width / width)
+    if scale < 1:
+        new_size = (int(width * scale), int(height * scale))
+        resized_image = cv2.resize(image, new_size, interpolation=cv2.INTER_LINEAR)
+        logger.debug(f"Ресайз изображения до {new_size}")
+        return resized_image
+    return image
+
+def is_face_clear(image, top, right, bottom, left):
+    """Проверяет, является ли лицо четким (без боке или размытия)."""
+    face = image[top:bottom, left:right]
+    height, width = face.shape[:2]
+    
+    # Простой критерий размера лица
+    if height < 35 or width < 35:  # Лицо слишком маленькое
+        logger.debug("Лицо слишком маленькое для анализа.")
+        return False
+
+    # Преобразуем в оттенки серого
+    gray = face if face.ndim == 2 else face.mean(axis=2)
+
+    # Резкость: Лапласиан
+    laplacian_var = np.var(cv2.Laplacian(gray, cv2.CV_64F))
+
+    # Резкость: Градиенты
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    gradient_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+    gradient_mean = np.mean(gradient_magnitude)
+
+    # Резкость: Фильтр высоких частот
+    high_pass = gray - cv2.GaussianBlur(gray, (5, 5), 10)
+    high_pass_variance = np.var(high_pass)
+
+    # Комбинированный критерий
+    if laplacian_var < 30 or gradient_mean < 20 or high_pass_variance < 10:
+        logger.debug(f"Недостаточная резкость: Laplacian={laplacian_var:.2f}, Gradient={gradient_mean:.2f}, HighPass={high_pass_variance:.2f}")
+        return False
+
+    return True
+
+def get_face_encoding(image_path, check_quality=False, resize=False):
+    """Получает эмбеддинг лиц с изображения, опционально фильтруя по качеству и ресайзом."""
     cache_path = f"{image_path}.npy"
 
-    # Проверяем, есть ли кеш
+    # Проверяем кеш
     if os.path.exists(cache_path):
         logger.debug(f"Загружаю кеш для {image_path}")
         return np.load(cache_path, allow_pickle=True)
     
-    # Вычисляем эмбеддинги
+    # Загружаем изображение
     logger.info(f"Обрабатываю изображение: {image_path}")
     image = face_recognition.load_image_file(image_path)
-    face_encodings = face_recognition.face_encodings(image)
-    
+
+    # Применяем ресайз, если требуется
+    if resize:
+        image = resize_image(image)
+
+    face_locations = face_recognition.face_locations(image)
+    face_encodings = []
+
+    for (top, right, bottom, left) in face_locations:
+        if check_quality:
+            if not is_face_clear(image, top, right, bottom, left):
+                logger.debug(f"Игнорирую лицо на {image_path} из-за качества.")
+                continue
+
+        encoding = face_recognition.face_encodings(image, [(top, right, bottom, left)])[0]
+        face_encodings.append(encoding)
+
     # Сохраняем в кеш
     np.save(cache_path, face_encodings)
     logger.info(f"Сохранён кеш: {cache_path} (лиц найдено: {len(face_encodings)})")
     return face_encodings
-
 
 def find_selfie_files(folder_path):
     """Находит все файлы _SELFIE* в папке."""
@@ -37,28 +99,25 @@ def find_selfie_files(folder_path):
     selfies.sort(key=lambda x: datetime.strptime(f"{x.split('_')[3]}_{x.split('_')[4]}", "%y%m%d_%H%M%S"))
     return selfies
 
-
-def match_photo(photo_path, selfie_encodings, threshold):
+def match_photo(photo_path, selfie_encodings, threshold, resize=False):
     """Сравнивает лицо на фотографии с эмбеддингами селфи."""
-    photo_encodings = get_face_encoding(photo_path)
+    photo_encodings = get_face_encoding(photo_path, check_quality=True, resize=resize)  # Проверяем качество и применяем ресайз
     for photo_encoding in photo_encodings:
         matches = face_recognition.compare_faces(selfie_encodings, photo_encoding, tolerance=threshold)
         if True in matches:
             return photo_path
     return None
 
-
-def find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold=0.52):
+def find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold=0.52, resize=False):
     """Находит совпадения фотографий с использованием параллельной обработки."""
     photo_paths = [os.path.join(all_photos_folder, f) for f in os.listdir(all_photos_folder) if f.endswith('.jpg')]
 
     with Pool(cpu_count()) as pool:
-        results = pool.starmap(match_photo, [(path, selfie_encodings, threshold) for path in photo_paths])
+        results = pool.starmap(match_photo, [(path, selfie_encodings, threshold, resize) for path in photo_paths])
 
     matching_photos = [result for result in results if result]
     logger.info(f"Найдено совпадений: {len(matching_photos)}")
     return matching_photos
-
 
 def copy_photos_to_selfie_folder(matching_photos, target_folder):
     """Копирует фотографии в папку с _SELFIE*."""
@@ -66,8 +125,7 @@ def copy_photos_to_selfie_folder(matching_photos, target_folder):
         shutil.copy(photo, target_folder)
         logger.info(f"Скопировано: {photo} -> {target_folder}")
 
-
-def process_selfie_files(folder_path, all_photos_folder, threshold):
+def process_selfie_files(folder_path, all_photos_folder, threshold, resize=False):
     """Обрабатывает все _SELFIE* файлы в папке."""
     selfies = find_selfie_files(folder_path)
     selfie_count = len(selfies)
@@ -83,8 +141,8 @@ def process_selfie_files(folder_path, all_photos_folder, threshold):
         selfie_path = os.path.join(folder_path, selfie_file)
         logger.info(f"Обрабатываю _SELFIE файл: {selfie_path}")
         
-        # Получаем эмбеддинги лиц на _SELFIE*
-        selfie_encodings = get_face_encoding(selfie_path)
+        # Получаем эмбеддинги лиц на _SELFIE*, без проверки качества
+        selfie_encodings = get_face_encoding(selfie_path, check_quality=False, resize=resize)
         
         if selfie_encodings is None or len(selfie_encodings) == 0:
             logger.warning(f"Не найдено лиц на изображении: {selfie_path}")
@@ -93,7 +151,7 @@ def process_selfie_files(folder_path, all_photos_folder, threshold):
         found_faces = True
 
         # Находим совпадающие фотографии в @all_photos параллельно
-        matching_photos = find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold)
+        matching_photos = find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold, resize)
         
         # Копируем найденные фотографии в папку с _SELFIE*
         if matching_photos:
@@ -105,13 +163,12 @@ def process_selfie_files(folder_path, all_photos_folder, threshold):
     
     return selfie_count, total_copied, found_faces
 
-
 def main():
     start_time = time.time()
 
     images_folder = 'images'
     all_photos_folder = os.path.join(images_folder, '@all_photos')
-    threshold = 0.5  # Пороговое значение для сравнения
+    threshold = 0.52  # Пороговое значение для сравнения
 
     # Информация в начале
     selfie_folders = [f for f in os.listdir(images_folder) if os.path.isdir(os.path.join(images_folder, f)) and f != '@all_photos']
@@ -130,7 +187,7 @@ def main():
         logger.info(f"Обрабатываю папку: {folder_path}")
         
         # Обрабатываем все _SELFIE* файлы в текущей папке
-        selfie_count, copied_count, found_faces = process_selfie_files(folder_path, all_photos_folder, threshold)
+        selfie_count, copied_count, found_faces = process_selfie_files(folder_path, all_photos_folder, threshold, resize=True)
         total_selfies += selfie_count
         total_copied_photos += copied_count
 
