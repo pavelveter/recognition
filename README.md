@@ -20,7 +20,7 @@ This project identifies faces in photos and copies matching photos from the `@al
 
 ```bash
 git clone <repository_url>
-cd face_matching_project
+cd recognition
 ```
 
 ### Step 2: Create a Virtual Environment
