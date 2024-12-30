@@ -46,7 +46,7 @@ if [[ -d "$cache_dir" ]]; then
     find "$cache_dir" -type f -mtime +30 -exec rm {} \;
     echo "Удалены файлы старше месяца в $cache_dir."
 else
-    echo "Папка $cache_dir не найдена."
+    echo "Папка $cache_dir не найдена. Да и пофиг"
 fi
 
 # 7. Запустить recognition.py через uv
