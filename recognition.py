@@ -1,14 +1,14 @@
+import logging
 import os
 import shutil
-import face_recognition
 from datetime import datetime
-import logging
+import face_recognition
 import numpy as np
+import cv2
+from skimage.feature import local_binary_pattern
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import time
-import cv2
-from skimage.feature import local_binary_pattern
 import configparser
 from yadisk import YaDisk
 from yadisk.exceptions import PathExistsError
@@ -22,14 +22,23 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 # Извлечение значений из конфигурации
+
+# Делать ли ресайз?
+resize = config.getboolean('settings', 'resize')
+# И если делать – то до какого размера
 max_size = tuple(map(int, config.get('settings', 'max_size').split(',')))
+# Максимальный размер детектируемого лица в пикселях
+min_face_size = int(max(max_size) / 33)
+
+# Как вести себя с размытыми изображениями
 laplacian_threshold = config.getint('settings', 'laplacian_threshold')
 gradient_threshold = config.getint('settings', 'gradient_threshold')
 high_pass_threshold = config.getint('settings', 'high_pass_threshold')
 high_freq_threshold = config.getint('settings', 'high_freq_threshold')
 lbp_threshold = config.getint('settings', 'lbp_threshold')
 threshold = config.getfloat('settings', 'threshold')
-resize = config.getboolean('settings', 'resize')
+
+# Всякие пути
 images_folder = config.get('paths', 'images')
 all_photos_folder = config.get('paths', 'all_photos')
 cache_numpy_folder = config.get('paths', 'cache')
@@ -205,7 +214,7 @@ def is_face_clear(image, top, right, bottom, left):
     height, width = face.shape[:2]
     
     # Простой критерий размера лица
-    if height < 35 or width < 35:  # Лицо слишком маленькое
+    if height < min_face_size or width < min_face_size:  # Лицо слишком маленькое
         logger.debug("Лицо слишком маленькое для анализа.")
         return False
 
@@ -382,7 +391,7 @@ def main():
         logger.error("Не удалось выбрать источник селфи.")
         return
 
-    selfie_folders = [f for f in os.listdir(selfie_folder) if os.path.isdir(os.path.join(selfie_folder, f)) and f != '@all_photos']
+    selfie_folders = [f for f in os.listdir(selfie_folder) if os.path.isdir(os.path.join(selfie_folder, f)) and f != all_photos_folder]
     total_selfie_folders = len(selfie_folders)
     total_all_photos = len([f for f in os.listdir(all_photos_folder) if f.endswith('.jpg')])
 
