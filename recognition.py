@@ -9,6 +9,7 @@ import time
 import cv2
 from skimage.feature import local_binary_pattern
 import configparser
+from yadisk import YaDisk
 
 # Настроим логгирование
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -27,8 +28,85 @@ high_freq_threshold = config.getint('settings', 'high_freq_threshold')
 lbp_threshold = config.getint('settings', 'lbp_threshold')
 threshold = config.getfloat('settings', 'threshold')
 resize = config.getboolean('settings', 'resize')
-images_folder = config.get('paths', 'images_folder')
+images_folder = config.get('paths', 'images')
 all_photos_folder = config.get('paths', 'all_photos')
+cache_numpy_folder = config.get('paths', 'cache')
+selfies_default = config.get('paths', 'selfies_default')
+
+# Yandex.Disk настройка
+cloud_selfies = config.get('cloud', 'cloud_selfies')
+yadisk_token = config.get('cloud', 'token')
+disk = YaDisk(token=yadisk_token)
+
+
+def list_yadisk_folders(path):
+    """Возвращает список папок на Yandex.Disk."""
+    try:
+        items = [item for item in disk.listdir(path) if item['type'] == 'dir']
+        return [item['name'] for item in items]
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка папок на Yandex.Disk: {e}")
+        return []
+
+
+def download_yadisk_folder(disk, cloud_path, local_path):
+    """Рекурсивно загружает папку с Yandex.Disk в локальную директорию."""
+    try:
+        os.makedirs(local_path, exist_ok=True)
+        for item in disk.listdir(cloud_path):
+            item_cloud_path = item.path
+            item_local_path = os.path.join(local_path, item.name)
+            
+            if item.type == 'dir':
+                # Рекурсивный вызов для подпапок
+                download_yadisk_folder(disk, item_cloud_path, item_local_path)
+            elif item.type == 'file':
+                # Загрузка файла
+                with open(item_local_path, 'wb') as f:
+                    disk.download(item_cloud_path, f)
+                logger.info(f"Загружено: {item_cloud_path} -> {item_local_path}")
+        
+        logger.info(f"Папка {cloud_path} успешно загружена в {local_path}")
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке папки {cloud_path}: {e}")
+
+
+def choose_selfie_source():
+    """Выбор источника для обработки селфи."""
+    logger.info("Выберите источник селфи:")
+    logger.info("1: Использовать локальную папку (selfies_default)")
+    logger.info("2: Скачать папку с Yandex.Disk (cloud_selfies)")
+
+    choice = input("Введите ваш выбор (1/2): ").strip()
+
+    if choice == '1':
+        logger.info(f"Выбрана локальная папка: {selfies_default}")
+        return selfies_default
+
+    elif choice == '2':
+        folders = list_yadisk_folders(cloud_selfies)
+        if not folders:
+            logger.error("Нет доступных папок на Yandex.Disk.")
+            return None
+
+        logger.info("Доступные папки на Yandex.Disk:")
+        for idx, folder in enumerate(folders, 1):
+            logger.info(f"{idx}: {folder}")
+
+        folder_idx = int(input("Введите номер папки для загрузки: ").strip()) - 1
+        if 0 <= folder_idx < len(folders):
+            selected_folder = folders[folder_idx]
+            local_path = os.path.join(images_folder, selected_folder)
+            cloud_path = f"{cloud_selfies}/{selected_folder}"
+            download_yadisk_folder(disk, cloud_path, local_path)
+            return local_path
+        else:
+            logger.error("Неверный выбор папки.")
+            return None
+
+    else:
+        logger.error("Неверный ввод.")
+        return None
 
 
 def resize_image(image, max_size=max_size):
@@ -210,13 +288,18 @@ def process_selfie_files(folder_path, all_photos_folder, threshold, resize=False
 
 
 def main():
-    start_time = time.time()
+    # Выбор источника селфи
+    selfie_folder = choose_selfie_source()
+    if not selfie_folder:
+        logger.error("Не удалось выбрать источник селфи.")
+        return
 
-    # Информация в начале
-    selfie_folders = [f for f in os.listdir(images_folder) if os.path.isdir(os.path.join(images_folder, f)) and f != '@all_photos']
+    selfie_folders = [f for f in os.listdir(selfie_folder) if os.path.isdir(os.path.join(selfie_folder, f)) and f != '@all_photos']
     total_selfie_folders = len(selfie_folders)
     total_all_photos = len([f for f in os.listdir(all_photos_folder) if f.endswith('.jpg')])
 
+    # Начинаем считать время на распознавание
+    start_time = time.time()
     logger.info(f"Всего папок с селфи: {total_selfie_folders}")
     logger.info(f"Всего фотографий в @all_photos: {total_all_photos}")
 
@@ -225,9 +308,9 @@ def main():
     no_faces_folders = []
 
     for folder_name in selfie_folders:
-        folder_path = os.path.join(images_folder, folder_name)
+        folder_path = os.path.join(selfie_folder, folder_name)
         logger.info(f"Обрабатываю папку: {folder_path}")
-        
+
         # Обрабатываем все _SELFIE* файлы в текущей папке
         selfie_count, copied_count, found_faces = process_selfie_files(folder_path, all_photos_folder, threshold, resize=resize)
         total_selfies += selfie_count
@@ -244,7 +327,8 @@ def main():
     logger.info(f"Обработано селфи: {total_selfies}")
     logger.info(f"Скопировано файлов: {total_copied_photos}")
     logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
-    logger.info(f"Время выполнения: {elapsed_time:.2f} секунд.")
+    logger.info(f"Время распознавания: {elapsed_time:.2f} секунд.")
 
 if __name__ == "__main__":
     main()
+
