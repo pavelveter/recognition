@@ -71,29 +71,54 @@ def download_yadisk_folder(disk, cloud_path, local_path):
         logger.error(f"Ошибка при загрузке папки {cloud_path}: {e}")
 
 
+def choose_all_photos_source():
+    """Выбор источника для обработки фотографий."""
+    logger.info(f"Введите путь к папке (или нажмите Enter для использования {all_photos_folder}):")
+    
+    # Ввод пути к папке
+    user_folder = input(f"Путь: ").strip()
+
+    # Если путь не введён, используем папку по умолчанию
+    if not user_folder:
+        logger.info(f"Используем папку по умолчанию: {all_photos_folder}")
+        return all_photos_folder
+
+    # Убираем возможные экранированные символы
+    user_folder = user_folder.replace("\\ ", " ").replace("\\\\", "\\").replace("'", "")
+    
+    logger.info(f"Выбран путь: {user_folder}")
+    if os.path.isdir(user_folder):
+        logger.info(f"Папка найдена: {user_folder}")
+        return user_folder
+    else:
+        logger.error("Указанный путь не существует или не является папкой.")
+        return None
+
+
 def choose_selfie_source():
     """Выбор источника для обработки селфи."""
+    # Получаем папки с Yandex.Disk
+    folders = list_yadisk_folders(cloud_selfies)
+    print(" ")
     logger.info("Выберите источник селфи:")
-    logger.info("1: Использовать локальную папку (selfies_default)")
-    logger.info("2: Скачать папку с Yandex.Disk (cloud_selfies)")
+    logger.info(f"0: Использовать локальную папку ({selfies_default})")
+    # Если есть папки на Yandex.Disk, выводим их для выбора
+    if folders:
+        for idx, folder in enumerate(folders, 1):
+            logger.info(f"{idx}: {folder}")
+    else:
+        logger.info("Нет доступных папок на Yandex.Disk.")
+    
+    # Пожелание выбрать
+    choice = input("Введите ваш выбор (0 для локальной папки, 1 и далее для Yandex.Disk): ").strip()
 
-    choice = input("Введите ваш выбор (1/2): ").strip()
-
-    if choice == '1':
+    # Проверяем ввод
+    if choice == '0':
         logger.info(f"Выбрана локальная папка: {selfies_default}")
         return selfies_default
 
-    elif choice == '2':
-        folders = list_yadisk_folders(cloud_selfies)
-        if not folders:
-            logger.error("Нет доступных папок на Yandex.Disk.")
-            return None
-
-        logger.info("Доступные папки на Yandex.Disk:")
-        for idx, folder in enumerate(folders, 1):
-            logger.info(f"{idx}: {folder}")
-
-        folder_idx = int(input("Введите номер папки для загрузки: ").strip()) - 1
+    try:
+        folder_idx = int(choice) - 1  # Преобразуем введённый индекс в корректный индекс для папок на Yandex.Disk
         if 0 <= folder_idx < len(folders):
             selected_folder = folders[folder_idx]
             local_path = os.path.join(images_folder, selected_folder)
@@ -101,12 +126,12 @@ def choose_selfie_source():
             download_yadisk_folder(disk, cloud_path, local_path)
             return local_path
         else:
-            logger.error("Неверный выбор папки.")
+            logger.error("Неверный выбор папки на Yandex.Disk.")
             return None
-
-    else:
+    except ValueError:
         logger.error("Неверный ввод.")
         return None
+
 
 
 def resize_image(image, max_size=max_size):
@@ -179,13 +204,20 @@ def is_face_clear(image, top, right, bottom, left):
 
 def get_face_encoding(image_path, check_quality=False, resize=False):
     """Получает эмбеддинг лиц с изображения, опционально фильтруя по качеству и ресайзом."""
-    cache_path = f"{image_path}.npy"
+    # Получаем имя файла (без пути) для кеша
+    filename = os.path.basename(image_path)
+    
+    # Формируем путь для кеша с файлом .npy в директории cache_numpy_folder
+    cache_path = os.path.join(cache_numpy_folder, filename + ".npy")
+
+    # Убедимся, что директория для кеша существует
+    os.makedirs(cache_numpy_folder, exist_ok=True)
 
     # Проверяем кеш
     if os.path.exists(cache_path):
         logger.debug(f"Загружаю кеш для {image_path}")
         return np.load(cache_path, allow_pickle=True)
-    
+
     # Загружаем изображение
     logger.info(f"Обрабатываю изображение: {image_path}")
     image = face_recognition.load_image_file(image_path)
@@ -210,6 +242,8 @@ def get_face_encoding(image_path, check_quality=False, resize=False):
     np.save(cache_path, face_encodings)
     logger.info(f"Сохранён кеш: {cache_path} (лиц найдено: {len(face_encodings)})")
     return face_encodings
+
+
 
 
 def find_selfie_files(folder_path):
@@ -288,6 +322,12 @@ def process_selfie_files(folder_path, all_photos_folder, threshold, resize=False
 
 
 def main():
+    # Выбор источника всех фоток
+    all_photos_folder = choose_all_photos_source()
+    if not all_photos_folder:
+        logger.error("Не удалось выбрать источник всего фотоотчёта.")
+        return
+
     # Выбор источника селфи
     selfie_folder = choose_selfie_source()
     if not selfie_folder:
@@ -323,7 +363,8 @@ def main():
     elapsed_time = end_time - start_time
 
     # Итоговая информация
-    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в @all_photos: {total_all_photos}")
+    print(" ")
+    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}")
     logger.info(f"Обработано селфи: {total_selfies}")
     logger.info(f"Скопировано файлов: {total_copied_photos}")
     logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
