@@ -13,10 +13,6 @@ import configparser
 from yadisk import YaDisk
 from yadisk.exceptions import PathExistsError
 
-# Настроим логгирование
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger()
-
 # Чтение конфигурации
 config = configparser.ConfigParser()
 config.read('config.ini')
@@ -48,6 +44,25 @@ selfies_default = config.get('paths', 'selfies_default')
 cloud_selfies = config.get('cloud', 'cloud_selfies')
 yadisk_token = config.get('cloud', 'token')
 disk = YaDisk(token=yadisk_token)
+
+# Настроим основной логгер
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)  # Установим уровень логирования для вашего приложения
+
+# Настроим логгер для Yandex.Disk (или другой используемой библиотеки)
+yadisk_logger = logging.getLogger('yadisk')  # Логгер для библиотеки yadisk
+yadisk_logger.setLevel(logging.WARNING)  # Установим уровень WARNING, чтобы скрыть INFO и ниже
+
+# Создаем хендлер для вывода логов в консоль
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)  # Печатаем только INFO и выше для своего приложения
+
+# Формат логов
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+
+# Добавляем хендлер в логгер
+logger.addHandler(console_handler)
 
 
 def list_yadisk_folders(path):
@@ -117,7 +132,7 @@ def upload_yadisk_folder(disk, local_path, cloud_path):
                 except Exception as e:
                     logger.error(f"Ошибка при загрузке файла {item_local_path}: {e}")
         
-        logger.info(f"Папка {local_path} успешно обработана в {cloud_path}")
+        logger.info(f"Папка {local_path} успешно загружена в {cloud_path}")
     except Exception as e:
         logger.error(f"Ошибка при загрузке папки {local_path}: {e}")
 
@@ -394,7 +409,7 @@ def main():
         return
     
     end_download_time = time.time()
-    download_elapsed_time = end_download_time - start_download_time
+    download_elapsed_time = round(end_download_time - start_download_time)
 
     selfie_folders = [f for f in os.listdir(selfie_folder) if os.path.isdir(os.path.join(selfie_folder, f)) and f != all_photos_folder]
     total_selfie_folders = len(selfie_folders)
@@ -423,7 +438,7 @@ def main():
             no_faces_folders.append(folder_name)
 
     end_time = time.time()
-    elapsed_time = end_time - start_time
+    elapsed_time = round(end_time - start_time)
 
     print(" ")
     logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}")
@@ -453,7 +468,7 @@ def main():
             pool.map(process_folder_partial, selfie_folders)
 
         end_upload_time = time.time()
-        upload_elapsed_time = end_upload_time - start_upload_time
+        upload_elapsed_time = round(end_upload_time - start_upload_time)
         
         logger.info("Загрузка найденных фотографий на Яндекс.Диск завершена.")
     else:
@@ -466,9 +481,9 @@ def main():
     logger.info(f"Обработано селфи: {total_selfies}")
     logger.info(f"Скопировано файлов: {total_copied_photos}")
     logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
-    logger.info(f"Время распознавания: {elapsed_time:.2f} секунд.")
-    logger.info(f"Общее время скачивания: {download_elapsed_time:.2f} секунд.")
-    logger.info(f"Общее время загрузки: {upload_elapsed_time:.2f} секунд.")
+    logger.info(f"Время распознавания: {elapsed_time} секунд.")
+    logger.info(f"Общее время скачивания: {download_elapsed_time} секунд.")
+    logger.info(f"Общее время загрузки: {upload_elapsed_time} секунд.")
     print(" ")
 
 
