@@ -13,7 +13,9 @@ dependencies = [
     "numpy==2.2.1",
     "opencv-python==4.10.0.84",
     "pillow==11.0.0",
+    "requests>=2.32.3",
     "scikit-image>=0.25.0",
     "scipy==1.14.1",
     "setuptools==75.6.0",
+    "yadisk>=3.1.0",
 ]
