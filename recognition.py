@@ -384,12 +384,17 @@ def main():
     if not all_photos_folder:
         logger.error("Не удалось выбрать источник всего фотоотчёта.")
         return
-
+    # Начинаем считать время на скачивание с Яндекс.Диск
+    start_download_time = time.time()
+ 
     # Выбор источника селфи
     selfie_folder = choose_selfie_source()
     if not selfie_folder:
         logger.error("Не удалось выбрать источник селфи.")
         return
+    
+    end_download_time = time.time()
+    download_elapsed_time = end_download_time - start_download_time
 
     selfie_folders = [f for f in os.listdir(selfie_folder) if os.path.isdir(os.path.join(selfie_folder, f)) and f != all_photos_folder]
     total_selfie_folders = len(selfie_folders)
@@ -420,19 +425,20 @@ def main():
     end_time = time.time()
     elapsed_time = end_time - start_time
 
-    # Итоговая информация
     print(" ")
     logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}")
     logger.info(f"Обработано селфи: {total_selfies}")
     logger.info(f"Скопировано файлов: {total_copied_photos}")
     logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
-    logger.info(f"Время распознавания: {elapsed_time:.2f} секунд.")
     print(" ")
 
     # Попросим пользователя нажать Enter для начала загрузки, либо ввести что-то для выхода
-    user_input = input("Нажмите Enter для загрузки всех распознанных фото на Яндекс.Диск, или введите что-либо для выхода: ").strip()
+    user_input = input("Нажми Enter для загрузки распознанных фото на Яндекс.Диск, или введи что-то для выхода: ").strip()
 
     if user_input == "":
+        # Начинаем считать время на загрузку
+        start_upload_time = time.time()
+   
         # Получаем токен из объекта disk
         token = disk.token
         
@@ -445,11 +451,25 @@ def main():
         # Создаем пул процессов и запускаем параллельную обработку
         with Pool(num_processes) as pool:
             pool.map(process_folder_partial, selfie_folders)
+
+        end_upload_time = time.time()
+        upload_elapsed_time = end_upload_time - start_upload_time
         
         logger.info("Загрузка найденных фотографий на Яндекс.Диск завершена.")
     else:
         logger.info("Выход из программы.")
         return
+
+    # Итоговая информация
+    print(" ")
+    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}")
+    logger.info(f"Обработано селфи: {total_selfies}")
+    logger.info(f"Скопировано файлов: {total_copied_photos}")
+    logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
+    logger.info(f"Время распознавания: {elapsed_time:.2f} секунд.")
+    logger.info(f"Общее время скачивания: {download_elapsed_time:.2f} секунд.")
+    logger.info(f"Общее время загрузки: {upload_elapsed_time:.2f} секунд.")
+    print(" ")
 
 
 if __name__ == "__main__":

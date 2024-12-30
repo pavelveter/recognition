@@ -60,4 +60,5 @@ if [[ -n "$VIRTUAL_ENV" ]]; then
     [[ "$VIRTUAL_ENV" != "" ]] && deactivate
 fi
 
-echo "Вот такие пироги"
+echo " "
+read -p "Вот такие пироги..."
