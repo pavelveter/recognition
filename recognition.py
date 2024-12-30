@@ -78,7 +78,7 @@ def download_yadisk_folder(disk, cloud_path, local_path):
                         disk.download(item_cloud_path, f)
                     logger.info(f"Загружено: {item_cloud_path} -> {item_local_path}")
                 else:
-                    logger.info(f"Пропущено: {item_cloud_path} (не начинается с '_SELFIE')")
+                    logger.debug(f"Пропущено: {item_cloud_path} (не начинается с '_SELFIE')")
         
         logger.info(f"Папка {cloud_path} успешно обработана, загружены файлы '_SELFIE' в {local_path}")
     except Exception as e:
