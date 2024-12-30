@@ -2,3 +2,4 @@ images*
 .venv
 *.npy
 config.ini
+numpy_cache
