@@ -5,11 +5,13 @@ from datetime import datetime
 import logging
 import numpy as np
 from multiprocessing import Pool, cpu_count
+from functools import partial
 import time
 import cv2
 from skimage.feature import local_binary_pattern
 import configparser
 from yadisk import YaDisk
+from yadisk.exceptions import PathExistsError
 
 # Настроим логгирование
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -50,7 +52,7 @@ def list_yadisk_folders(path):
 
 
 def download_yadisk_folder(disk, cloud_path, local_path):
-    """Рекурсивно загружает папку с Yandex.Disk в локальную директорию."""
+    """Рекурсивно загружает папку с Yandex.Disk в локальную директорию, сохраняя только файлы, начинающиеся с '_SELFIE'."""
     try:
         os.makedirs(local_path, exist_ok=True)
         for item in disk.listdir(cloud_path):
@@ -61,14 +63,63 @@ def download_yadisk_folder(disk, cloud_path, local_path):
                 # Рекурсивный вызов для подпапок
                 download_yadisk_folder(disk, item_cloud_path, item_local_path)
             elif item.type == 'file':
-                # Загрузка файла
-                with open(item_local_path, 'wb') as f:
-                    disk.download(item_cloud_path, f)
-                logger.info(f"Загружено: {item_cloud_path} -> {item_local_path}")
+                # Загрузка только файлов, начинающихся с '_SELFIE'
+                if item.name.startswith('_SELFIE'):
+                    with open(item_local_path, 'wb') as f:
+                        disk.download(item_cloud_path, f)
+                    logger.info(f"Загружено: {item_cloud_path} -> {item_local_path}")
+                else:
+                    logger.info(f"Пропущено: {item_cloud_path} (не начинается с '_SELFIE')")
         
-        logger.info(f"Папка {cloud_path} успешно загружена в {local_path}")
+        logger.info(f"Папка {cloud_path} успешно обработана, загружены файлы '_SELFIE' в {local_path}")
     except Exception as e:
-        logger.error(f"Ошибка при загрузке папки {cloud_path}: {e}")
+        logger.error(f"Ошибка при обработке папки {cloud_path}: {e}")
+
+
+def upload_yadisk_folder(disk, local_path, cloud_path):
+    """Рекурсивно загружает папку из локальной директории в Yandex.Disk, исключая файлы с именем _SELFIE*."""
+    try:
+        # Проверяем существование папки перед созданием
+        try:
+            disk.mkdir(cloud_path)
+        except PathExistsError:
+            logger.info(f"Папка {cloud_path} существует на Яндекс.Диске")
+        
+        # Проходим по всем файлам и папкам в локальной директории
+        for item_name in os.listdir(local_path):
+            item_local_path = os.path.join(local_path, item_name)
+            item_cloud_path = os.path.join(cloud_path, item_name)
+            
+            # Пропускаем файлы, начинающиеся с _SELFIE
+            if item_name.startswith('_SELFIE') and item_name.endswith('.jpg'):
+                logger.info(f"Пропущен файл: {item_local_path} (формат _SELFIE)")
+                continue
+            
+            if os.path.isdir(item_local_path):
+                # Рекурсивно загружаем подпапки
+                upload_yadisk_folder(disk, item_local_path, item_cloud_path)
+            elif os.path.isfile(item_local_path):
+                # Пытаемся загрузить файл
+                try:
+                    disk.upload(item_local_path, item_cloud_path, overwrite=False)
+                    logger.info(f"Загружен: {item_local_path} -> {item_cloud_path}")
+                except PathExistsError:
+                    logger.info(f"Файл {item_cloud_path} уже существует на Яндекс.Диске")
+                except Exception as e:
+                    logger.error(f"Ошибка при загрузке файла {item_local_path}: {e}")
+        
+        logger.info(f"Папка {local_path} успешно обработана в {cloud_path}")
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке папки {local_path}: {e}")
+
+
+def process_folder(token, selfie_folder, cloud_selfies, folder_name):
+    # Создаем новый экземпляр клиента Яндекс.Диска для каждого процесса
+    disk = YaDisk(token=token)
+    
+    folder_path = os.path.join(selfie_folder, folder_name)
+    cloud_path = f"{cloud_selfies}/{selfie_folder.split('/')[-1]}/{folder_name}"
+    upload_yadisk_folder(disk, folder_path, cloud_path)
 
 
 def choose_all_photos_source():
@@ -131,7 +182,6 @@ def choose_selfie_source():
     except ValueError:
         logger.error("Неверный ввод.")
         return None
-
 
 
 def resize_image(image, max_size=max_size):
@@ -244,8 +294,6 @@ def get_face_encoding(image_path, check_quality=False, resize=False):
     return face_encodings
 
 
-
-
 def find_selfie_files(folder_path):
     """Находит все файлы _SELFIE* в папке."""
     selfies = [f for f in os.listdir(folder_path) if f.startswith("_SELFIE") and f.endswith(".jpg")]
@@ -340,8 +388,9 @@ def main():
 
     # Начинаем считать время на распознавание
     start_time = time.time()
+
     logger.info(f"Всего папок с селфи: {total_selfie_folders}")
-    logger.info(f"Всего фотографий в @all_photos: {total_all_photos}")
+    logger.info(f"Всего фотографий в отчёте: {total_all_photos}")
 
     total_selfies = 0
     total_copied_photos = 0
@@ -369,7 +418,30 @@ def main():
     logger.info(f"Скопировано файлов: {total_copied_photos}")
     logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
     logger.info(f"Время распознавания: {elapsed_time:.2f} секунд.")
+    print(" ")
+
+    # Попросим пользователя нажать Enter для начала загрузки, либо ввести что-то для выхода
+    user_input = input("Нажмите Enter для загрузки всех распознанных фото на Яндекс.Диск, или введите что-либо для выхода: ").strip()
+
+    if user_input == "":
+        # Получаем токен из объекта disk
+        token = disk.token
+        
+        # Создаем частичную функцию с токеном вместо объекта disk
+        process_folder_partial = partial(process_folder, token, selfie_folder, cloud_selfies)
+        
+        # Определяем количество процессов
+        num_processes = min(8, cpu_count())
+        
+        # Создаем пул процессов и запускаем параллельную обработку
+        with Pool(num_processes) as pool:
+            pool.map(process_folder_partial, selfie_folders)
+        
+        logger.info("Загрузка найденных фотографий на Яндекс.Диск завершена.")
+    else:
+        logger.info("Выход из программы.")
+        return
+
 
 if __name__ == "__main__":
     main()
-
