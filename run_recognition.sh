@@ -1,7 +1,18 @@
 #!/bin/bash
 
+# Указываем путь к config.ini
+config_file="config.ini"
+
 # 1. Установить текущую рабочую директорию в директорию запуска скрипта
 cd "$(dirname "$0")" || exit 1
+
+# Проверяем существование файла config.ini
+if [[ ! -f "$config_file" ]]; then
+    echo "Файл $config_file не найден. Пожалуйста, создай его."
+    read -n1 -r -p "Нажми любую клавишу для выхода..."
+    echo
+    exit 1
+fi
 
 # 2. Установить uv, если он не найден
 if ! command -v uv &>/dev/null; then
@@ -40,13 +51,18 @@ echo "Проверяю зависимости..."
 uv sync || { echo "Не удалось синхронизировать зависимости!"; exit 1; }
 
 # 6. Проверить папку numpy_cache и удалить старые файлы
-cache_dir="numpy_cache"
+cache_dir=$(grep -E '^\s*cache\s*=' "config.ini" | sed "s/^cache =//g;s/^ *//g")
 if [[ -d "$cache_dir" ]]; then
     echo "Проверяю файлы в $cache_dir..."
-    find "$cache_dir" -type f -mtime +30 -exec rm {} \;
-    echo "Удалены файлы старше месяца в $cache_dir."
+    deleted_count=$(find "$cache_dir" -type f -mtime +30 -print0 | xargs -0 -I {} rm {} \; | wc -l)
+
+    if [[ "$deleted_count" -gt 0 ]]; then
+        echo "Удалено $deleted_count файлов старше месяца в $cache_dir."
+    else
+        echo "Файлов старше месяца в $cache_dir не найдено."
+    fi
 else
-    echo "Папка $cache_dir не найдена. Да и пофиг"
+    echo "Папка $cache_dir не найдена. Да и пофиг."
 fi
 
 # 7. Запустить recognition.py через uv
