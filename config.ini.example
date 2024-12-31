@@ -27,7 +27,7 @@ lbp_threshold = 10
 images = images
 # путь к селфи по умолчанию
 selfies_default = images/@selfies
-# путь ко всем изображениям
+# путь ко всему фотоотчёту
 all_photos = images/@all_photos
 # путь к кешу numpy
 cache = numpy_cache
@@ -35,5 +35,5 @@ cache = numpy_cache
 [cloud]
 # токен Yandex.Disk
 token = y0_Rt0k3N
-# путь на Яндекс, пробел после / не случаен
+# путь на Яндекс.Диске, пробел после / не случаен
 cloud_selfies = / SelfieBot
