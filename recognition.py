@@ -477,10 +477,10 @@ def main():
 
     # Итоговая информация
     print(" ")
-    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}")
-    logger.info(f"Обработано селфи: {total_selfies}")
-    logger.info(f"Скопировано файлов: {total_copied_photos}")
-    logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
+    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}.")
+    logger.info(f"Обработано селфи: {total_selfies}.")
+    logger.info(f"Скопировано файлов: {total_copied_photos}.")
+    logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}.")
     logger.info(f"Время распознавания: {elapsed_time} секунд.")
     logger.info(f"Общее время скачивания: {download_elapsed_time} секунд.")
     logger.info(f"Общее время загрузки: {upload_elapsed_time} секунд.")
