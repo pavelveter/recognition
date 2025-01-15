@@ -25,6 +25,8 @@ resize = config.getboolean('settings', 'resize')
 max_size = tuple(map(int, config.get('settings', 'max_size').split(',')))
 # Максимальный размер детектируемого лица в пикселях
 min_face_size = int(max(max_size) / 33)
+# Проверять ли качество
+check_q = config.getboolean("settings", "check_quality")
 
 # Как вести себя с размытыми изображениями
 laplacian_threshold = config.getint('settings', 'laplacian_threshold')
@@ -327,7 +329,7 @@ def find_selfie_files(folder_path):
 
 def match_photo(photo_path, selfie_encodings, threshold, resize=False):
     """Сравнивает лицо на фотографии с эмбеддингами селфи."""
-    photo_encodings = get_face_encoding(photo_path, check_quality=True, resize=resize)  # Проверяем качество и применяем ресайз
+    photo_encodings = get_face_encoding(photo_path, check_quality=check_q, resize=resize)  # Проверяем качество и применяем ресайз
     for photo_encoding in photo_encodings:
         matches = face_recognition.compare_faces(selfie_encodings, photo_encoding, tolerance=threshold)
         if True in matches:
