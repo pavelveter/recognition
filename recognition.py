@@ -1,493 +1,832 @@
-import logging
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# recognition.py — утилита для матчинга селфи и фотоотчётов
+#
+# Copyright (C) 2025 Pavel Borisov (github.com/pavelveter)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+from __future__ import annotations
+
+# Анти-oversubscription — до импортов численных либ
 import os
-import shutil
-from datetime import datetime
-import face_recognition
-import numpy as np
-import cv2
-from skimage.feature import local_binary_pattern
-from multiprocessing import Pool, cpu_count
-from functools import partial
-import time
+os.environ.setdefault("OMP_NUM_THREADS", "1")       # OpenMP
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")  # OpenBLAS
+os.environ.setdefault("MKL_NUM_THREADS", "1")       # Intel MKL
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")   # NumExpr
+
+import argparse
 import configparser
+import csv
+import hashlib
+import json
+import logging
+import posixpath
+import random
+import shlex
+import shutil
+import time
+from datetime import datetime
+from functools import partial
+from multiprocessing import Pool, cpu_count, get_context
+from typing import Dict, List, Set, Tuple
+
+import cv2
+import numpy as np
+import face_recognition
+from PIL import Image, ImageOps  # EXIF-ориентация
+from skimage.feature import local_binary_pattern
 from yadisk import YaDisk
 from yadisk.exceptions import PathExistsError
 
-# Чтение конфигурации
+# HEIC/HEIF (опционально). Если пакета нет — JPEG/PNG работают как раньше.
+try:
+    import pillow_heif  # type: ignore
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+
+# ----------------------- Конфиг и логирование -----------------------
+
 config = configparser.ConfigParser()
-config.read('config.ini')
+config.read("config.ini")
 
-# Извлечение значений из конфигурации
+# settings
+resize_enabled: bool = config.getboolean("settings", "resize")
+w_str, h_str = (s.strip() for s in config.get("settings", "max_size").split(",", 1))
+w, h = int(w_str), int(h_str)
+max_size_tuple: tuple[int, int] = (w, h)
+min_face_size: int = int(max(max_size_tuple) / 33)
+check_q: bool = config.getboolean("settings", "check_quality")
 
-# Делать ли ресайз?
-resize = config.getboolean('settings', 'resize')
-# И если делать – то до какого размера
-max_size = tuple(map(int, config.get('settings', 'max_size').split(',')))
-# Максимальный размер детектируемого лица в пикселях
-min_face_size = int(max(max_size) / 33)
-# Проверять ли качество
-check_q = config.getboolean("settings", "check_quality")
+laplacian_threshold: int = config.getint("settings", "laplacian_threshold")
+gradient_threshold: int = config.getint("settings", "gradient_threshold")
+high_pass_threshold: int = config.getint("settings", "high_pass_threshold")
+high_freq_threshold: int = config.getint("settings", "high_freq_threshold")
+lbp_threshold: int = config.getint("settings", "lbp_threshold")
+threshold_val: float = config.getfloat("settings", "threshold")
 
-# Как вести себя с размытыми изображениями
-laplacian_threshold = config.getint('settings', 'laplacian_threshold')
-gradient_threshold = config.getint('settings', 'gradient_threshold')
-high_pass_threshold = config.getint('settings', 'high_pass_threshold')
-high_freq_threshold = config.getint('settings', 'high_freq_threshold')
-lbp_threshold = config.getint('settings', 'lbp_threshold')
-threshold = config.getfloat('settings', 'threshold')
+# paths
+images_root: str = config.get("paths", "images")
+selfies_default: str = config.get("paths", "selfies_default")
+all_photos_default: str = config.get("paths", "all_photos")
+cache_dir: str = config.get("paths", "cache")
+os.makedirs(cache_dir, exist_ok=True)
 
-# Всякие пути
-images_folder = config.get('paths', 'images')
-all_photos_folder = config.get('paths', 'all_photos')
-cache_numpy_folder = config.get('paths', 'cache')
-selfies_default = config.get('paths', 'selfies_default')
+# cloud
+cloud_selfies_root: str = config.get("cloud", "cloud_selfies")
+yadisk_token_cfg: str = config.get("cloud", "token", fallback="")
+yadisk_token: str = os.getenv("YADISK_TOKEN", yadisk_token_cfg)
 
-# Yandex.Disk настройка
-cloud_selfies = config.get('cloud', 'cloud_selfies')
-yadisk_token = config.get('cloud', 'token')
-disk = YaDisk(token=yadisk_token)
+# logging
+logger = logging.getLogger("recognition")
+logger.setLevel(logging.INFO)
+_sh = logging.StreamHandler()
+_sh.setFormatter(logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+))
+logger.addHandler(_sh)
+logging.getLogger("yadisk").setLevel(logging.WARNING)
 
-# Настроим основной логгер
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)  # Установим уровень логирования для вашего приложения
+# ----------------------- Путь на Я.Диске -----------------------
 
-# Настроим логгер для Yandex.Disk (или другой используемой библиотеки)
-yadisk_logger = logging.getLogger('yadisk')  # Логгер для библиотеки yadisk
-yadisk_logger.setLevel(logging.WARNING)  # Установим уровень WARNING, чтобы скрыть INFO и ниже
+def ypath_join(*parts: str) -> str:
+    """POSIX join для путей Я.Диска. Пробелы сохраняем, убираем пустые и лишние слэши."""
+    cleaned: tuple[str, ...] = tuple(
+        p.strip("/") for p in parts if p is not None and p != ""
+    )
+    if not cleaned:
+        return "/"
+    return posixpath.join(*cleaned)
 
-# Создаем хендлер для вывода логов в консоль
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  # Печатаем только INFO и выше для своего приложения
+# ----------------------- Утилиты загрузки изображений -----------------------
 
-# Формат логов
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
+def _load_image_rgb(path: str) -> np.ndarray:
+    """Открывает изображение с учётом EXIF-ориентации. Всегда RGB ndarray."""
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im)  # корректируем поворот
+        im = im.convert("RGB")
+        return np.array(im)
 
-# Добавляем хендлер в логгер
-logger.addHandler(console_handler)
+# ----------------------- Кеш эмбеддингов -----------------------
 
+def cache_key_for(path: str) -> str:
+    """abs_path|mtime_ns|size → sha1 (устойчивый ключ для инвалидации кеша)."""
+    st = os.stat(path)
+    raw = f"{os.path.abspath(path)}|{st.st_mtime_ns}|{st.st_size}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
 
-def list_yadisk_folders(path):
-    """Возвращает список папок на Yandex.Disk."""
-    try:
-        items = [item for item in disk.listdir(path) if item['type'] == 'dir']
-        return [item['name'] for item in items]
-    except Exception as e:
-        logger.error(f"Ошибка при получении списка папок на Yandex.Disk: {e}")
-        return []
+def cache_path_for(path: str) -> str:
+    """Уникальный .npy путь в кеше."""
+    base = os.path.basename(path)
+    return os.path.join(cache_dir, f"{base}.{cache_key_for(path)}.npy")
 
+# ----------------------- Ресайз -----------------------
 
-def download_yadisk_folder(disk, cloud_path, local_path):
-    """Рекурсивно загружает папку с Yandex.Disk в локальную директорию, сохраняя только файлы, начинающиеся с '_SELFIE'."""
-    try:
-        os.makedirs(local_path, exist_ok=True)
-        for item in disk.listdir(cloud_path):
-            item_cloud_path = item.path
-            item_local_path = os.path.join(local_path, item.name)
-            
-            if item.type == 'dir':
-                # Рекурсивный вызов для подпапок
-                download_yadisk_folder(disk, item_cloud_path, item_local_path)
-            elif item.type == 'file':
-                # Загрузка только файлов, начинающихся с '_SELFIE'
-                if item.name.startswith('_SELFIE'):
-                    with open(item_local_path, 'wb') as f:
-                        disk.download(item_cloud_path, f)
-                    logger.info(f"Загружено: {item_cloud_path} -> {item_local_path}")
-                else:
-                    logger.debug(f"Пропущено: {item_cloud_path} (не начинается с '_SELFIE')")
-        
-        logger.info(f"Папка {cloud_path} успешно обработана, загружены файлы '_SELFIE' в {local_path}")
-    except Exception as e:
-        logger.error(f"Ошибка при обработке папки {cloud_path}: {e}")
-
-
-def upload_yadisk_folder(disk, local_path, cloud_path):
-    """Рекурсивно загружает папку из локальной директории в Yandex.Disk, исключая файлы с именем _SELFIE*."""
-    try:
-        # Проверяем существование папки перед созданием
-        try:
-            disk.mkdir(cloud_path)
-        except PathExistsError:
-            logger.info(f"Папка {cloud_path} существует на Яндекс.Диске")
-        
-        # Проходим по всем файлам и папкам в локальной директории
-        for item_name in os.listdir(local_path):
-            item_local_path = os.path.join(local_path, item_name)
-            item_cloud_path = os.path.join(cloud_path, item_name)
-            
-            # Пропускаем файлы, начинающиеся с _SELFIE
-            if item_name.startswith('_SELFIE') and item_name.endswith('.jpg'):
-                logger.info(f"Пропущен файл: {item_local_path} (формат _SELFIE)")
-                continue
-            
-            if os.path.isdir(item_local_path):
-                # Рекурсивно загружаем подпапки
-                upload_yadisk_folder(disk, item_local_path, item_cloud_path)
-            elif os.path.isfile(item_local_path):
-                # Пытаемся загрузить файл
-                try:
-                    disk.upload(item_local_path, item_cloud_path, overwrite=False)
-                    logger.info(f"Загружен: {item_local_path} -> {item_cloud_path}")
-                except PathExistsError:
-                    logger.info(f"Файл {item_cloud_path} уже существует на Яндекс.Диске")
-                except Exception as e:
-                    logger.error(f"Ошибка при загрузке файла {item_local_path}: {e}")
-        
-        logger.info(f"Папка {local_path} успешно загружена в {cloud_path}")
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке папки {local_path}: {e}")
-
-
-def process_folder(token, selfie_folder, cloud_selfies, folder_name):
-    # Создаем новый экземпляр клиента Яндекс.Диска для каждого процесса
-    disk = YaDisk(token=token)
-    
-    folder_path = os.path.join(selfie_folder, folder_name)
-    cloud_path = f"{cloud_selfies}/{selfie_folder.split('/')[-1]}/{folder_name}"
-    upload_yadisk_folder(disk, folder_path, cloud_path)
-
-
-def choose_all_photos_source():
-    """Выбор источника для обработки фотографий."""
-    logger.info(f"Введите путь к папке (или нажмите Enter для использования {all_photos_folder}):")
-    
-    # Ввод пути к папке
-    user_folder = input(f"Путь: ").strip()
-
-    # Если путь не введён, используем папку по умолчанию
-    if not user_folder:
-        logger.info(f"Используем папку по умолчанию: {all_photos_folder}")
-        return all_photos_folder
-
-    # Убираем возможные экранированные символы
-    user_folder = user_folder.replace("\\ ", " ").replace("\\\\", "\\").replace("'", "")
-    
-    logger.info(f"Выбран путь: {user_folder}")
-    if os.path.isdir(user_folder):
-        logger.info(f"Папка найдена: {user_folder}")
-        return user_folder
-    else:
-        logger.error("Указанный путь не существует или не является папкой.")
-        return None
-
-
-def choose_selfie_source():
-    """Выбор источника для обработки селфи."""
-    # Получаем папки с Yandex.Disk
-    folders = list_yadisk_folders(cloud_selfies)
-    print(" ")
-    logger.info("Выберите источник селфи:")
-    logger.info(f"0: Использовать локальную папку ({selfies_default})")
-    # Если есть папки на Yandex.Disk, выводим их для выбора
-    if folders:
-        for idx, folder in enumerate(folders, 1):
-            logger.info(f"{idx}: {folder}")
-    else:
-        logger.info("Нет доступных папок на Yandex.Disk.")
-    
-    # Пожелание выбрать
-    choice = input("Введите ваш выбор (0 для локальной папки, 1 и далее для Yandex.Disk): ").strip()
-
-    # Проверяем ввод
-    if choice == '0':
-        logger.info(f"Выбрана локальная папка: {selfies_default}")
-        return selfies_default
-
-    try:
-        folder_idx = int(choice) - 1  # Преобразуем введённый индекс в корректный индекс для папок на Yandex.Disk
-        if 0 <= folder_idx < len(folders):
-            selected_folder = folders[folder_idx]
-            local_path = os.path.join(images_folder, selected_folder)
-            cloud_path = f"{cloud_selfies}/{selected_folder}"
-            download_yadisk_folder(disk, cloud_path, local_path)
-            return local_path
-        else:
-            logger.error("Неверный выбор папки на Yandex.Disk.")
-            return None
-    except ValueError:
-        logger.error("Неверный ввод.")
-        return None
-
-
-def resize_image(image, max_size=max_size):
-    """Ресайзит изображение, сохраняя пропорции."""
-    height, width = image.shape[:2]
-    max_height, max_width = max_size
-
-    # Вычисляем пропорции
-    scale = min(max_height / height, max_width / width)
-    if scale < 1:
-        new_size = (int(width * scale), int(height * scale))
-        resized_image = cv2.resize(image, new_size, interpolation=cv2.INTER_LINEAR)
-        logger.debug(f"Ресайз изображения до {new_size}")
-        return resized_image
+def resize_image(image: np.ndarray, max_hw: tuple[int, int]) -> np.ndarray:
+    """Ресайз с сохранением пропорций (bilinear)."""
+    h, w = image.shape[:2]
+    mh, mw = max_hw
+    scale = min(mh / h, mw / w)
+    if scale < 1.0:
+        new_size = (int(w * scale), int(h * scale))
+        return cv2.resize(image, new_size, interpolation=cv2.INTER_LINEAR)
     return image
 
+# ----------------------- Качество лица -----------------------
 
-def is_face_clear(image, top, right, bottom, left):
-    """Проверяет, является ли лицо четким (без боке или размытия)."""
-    face = image[top:bottom, left:right]
-    height, width = face.shape[:2]
-    
-    # Простой критерий размера лица
-    if height < min_face_size or width < min_face_size:  # Лицо слишком маленькое
-        logger.debug("Лицо слишком маленькое для анализа.")
+def is_face_clear(image_bgr: np.ndarray, top: int, right: int, bottom: int, left: int) -> bool:
+    """Оценка качества лица. Сначала дешёвые метрики, затем дорогие."""
+    face = image_bgr[top:bottom, left:right]
+    h, w = face.shape[:2]
+    if h < min_face_size or w < min_face_size:
         return False
 
-    # Преобразуем в оттенки серого
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
 
-    # Резкость: Лапласиан
-    laplacian_var = np.var(cv2.Laplacian(gray, cv2.CV_64F))
+    lap_var = float(np.var(cv2.Laplacian(gray, cv2.CV_64F)))
+    if lap_var >= laplacian_threshold:
+        return True
 
-    # Резкость: Градиенты
     sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    gradient_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
-    gradient_mean = np.mean(gradient_magnitude)
+    grad_mean = float(np.mean(np.sqrt(sobel_x**2 + sobel_y**2)))
+    if grad_mean >= gradient_threshold:
+        return True
 
-    # Резкость: Фильтр высоких частот
     high_pass = gray - cv2.GaussianBlur(gray, (5, 5), 10)
-    high_pass_variance = np.var(high_pass)
+    high_pass_var = float(np.var(high_pass))
 
-    # Анализ боке: Частотный спектр
     fft = np.fft.fft2(gray)
-    fft_magnitude = np.abs(np.fft.fftshift(fft))
-    high_freq_mean = np.mean(fft_magnitude[fft_magnitude > np.percentile(fft_magnitude, 95)])
+    fft_mag = np.abs(np.fft.fftshift(fft))
+    mask95 = fft_mag > np.percentile(fft_mag, 95)
+    high_freq_mean = float(np.mean(fft_mag[mask95]))
 
-    # Оценка текстуры: Локальные бинарные паттерны (LBP)
     radius = 1
     n_points = 8 * radius
     lbp = local_binary_pattern(gray.astype(np.uint8), n_points, radius, method="uniform")
-    lbp_mean = np.mean(lbp)
+    lbp_mean = float(np.mean(lbp))
 
-    # Применяем все критерии с учетом порогов
-    if (laplacian_var < laplacian_threshold or 
-        gradient_mean < gradient_threshold or 
-        high_pass_variance < high_pass_threshold or 
+    if (grad_mean < gradient_threshold or
+        high_pass_var < high_pass_threshold or
         high_freq_mean < high_freq_threshold or
         lbp_mean > lbp_threshold):
         logger.debug(
-            f"Недостаточная резкость: Laplacian={laplacian_var:.2f}, "
-            f"Gradient={gradient_mean:.2f}, HighPass={high_pass_variance:.2f}, "
-            f"FFT_HighFreq={high_freq_mean:.2f}, LBP={lbp_mean:.2f}"
+            f"Low quality: Lap={lap_var:.2f}, Grad={grad_mean:.2f}, "
+            f"HPVar={high_pass_var:.2f}, FFT95={high_freq_mean:.2f}, LBP={lbp_mean:.2f}"
         )
         return False
-
     return True
 
+# ----------------------- Энкодинг лиц (с кешом) -----------------------
 
-def get_face_encoding(image_path, check_quality=False, resize=False):
-    """Получает эмбеддинг лиц с изображения, опционально фильтруя по качеству и ресайзом."""
-    # Получаем имя файла (без пути) для кеша
-    filename = os.path.basename(image_path)
-    
-    # Формируем путь для кеша с файлом .npy в директории cache_numpy_folder
-    cache_path = os.path.join(cache_numpy_folder, filename + ".npy")
+def load_encodings_for_image(image_path: str, *, check_quality: bool, do_resize: bool) -> list[np.ndarray]:
+    """Читает/считает эмбеддинги (128-d) для фото. Кеш в .npy (float32 матрица)."""
+    cpath = cache_path_for(image_path)
+    if os.path.exists(cpath):
+        try:
+            arr = np.load(cpath, allow_pickle=True)
+            if arr.dtype == object:           # старый формат
+                return arr.tolist()
+            return [row for row in np.asarray(arr, dtype=np.float32)]  # новый формат
+        except Exception as e:
+            logger.warning(f"Cache read failed, recompute: {cpath} ({e})")
 
-    # Убедимся, что директория для кеша существует
-    os.makedirs(cache_numpy_folder, exist_ok=True)
+    base = os.path.basename(image_path)
+    if base.startswith('.') or base.startswith('._'):  # AppleDouble/скрытые
+        np.save(cpath, np.empty((0, 128), dtype=np.float32), allow_pickle=False)
+        return []
 
-    # Проверяем кеш
-    if os.path.exists(cache_path):
-        logger.debug(f"Загружаю кеш для {image_path}")
-        return np.load(cache_path, allow_pickle=True)
+    try:
+        image_rgb = _load_image_rgb(image_path)  # EXIF-aware loader
+    except Exception as e:
+        logger.warning(f"Skip unreadable image: {image_path} ({e})")
+        np.save(cpath, np.empty((0, 128), dtype=np.float32), allow_pickle=False)
+        return []
 
-    # Загружаем изображение
-    logger.info(f"Обрабатываю изображение: {image_path}")
-    image = face_recognition.load_image_file(image_path)
+    if do_resize:
+        image_rgb = resize_image(image_rgb, max_size_tuple)
 
-    # Применяем ресайз, если требуется
-    if resize:
-        image = resize_image(image)
+    # На CPU 'hog' обычно быстрее; с CUDA dlib можно сменить на 'cnn'
+    face_locs = face_recognition.face_locations(image_rgb, model="hog")
+    encs: list[np.ndarray] = []
 
-    face_locations = face_recognition.face_locations(image)
-    face_encodings = []
-
-    for (top, right, bottom, left) in face_locations:
-        if check_quality:
-            if not is_face_clear(image, top, right, bottom, left):
-                logger.debug(f"Игнорирую лицо на {image_path} из-за качества.")
+    bgr_for_q = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR) if check_quality else None
+    for (top, right, bottom, left) in face_locs:
+        if check_quality and bgr_for_q is not None:
+            if not is_face_clear(bgr_for_q, top, right, bottom, left):
                 continue
+        face_enc = face_recognition.face_encodings(image_rgb, [(top, right, bottom, left)])
+        if face_enc:
+            encs.append(face_enc[0].astype(np.float32, copy=False))  # сразу float32
 
-        encoding = face_recognition.face_encodings(image, [(top, right, bottom, left)])[0]
-        face_encodings.append(encoding)
+    enc_mat = np.asarray(encs, dtype=np.float32) if encs else np.empty((0, 128), dtype=np.float32)
+    np.save(cpath, enc_mat, allow_pickle=False)
+    return [row for row in enc_mat]
 
-    # Сохраняем в кеш
-    np.save(cache_path, face_encodings)
-    logger.info(f"Сохранён кеш: {cache_path} (лиц найдено: {len(face_encodings)})")
-    return face_encodings
+def find_selfie_files(folder_path: str) -> list[str]:
+    """_SELFIE*.jpg, отсортированные по времени из имени; при ошибке — по mtime."""
+    files = [f for f in os.listdir(folder_path)
+             if f.startswith("_SELFIE") and f.lower().endswith(".jpg")]
+    def key(name: str):
+        try:
+            parts = name.split("_")
+            return datetime.strptime(f"{parts[3]}_{parts[4]}", "%y%m%d_%H%M%S")
+        except Exception:
+            return datetime.fromtimestamp(os.path.getmtime(os.path.join(folder_path, name)))
+    return sorted(files, key=key)
+
+# ----------------------- Яндекс.Диск: листинг/загрузка/выгрузка -----------------------
+
+def list_yadisk_folders(disk: YaDisk, path: str) -> list[str]:
+    try:
+        items = [it for it in disk.listdir(path) if getattr(it, "type", "") == "dir"]
+        return [it.name for it in items if it.name is not None]
+    except Exception as e:
+        logger.error(f"Я.Диск: не получил список папок '{path}': {e}")
+        return []
+
+# Параллельная загрузка только _SELFIE*.jpg
+def collect_selfie_files(disk: YaDisk, cloud_root: str, local_root: str, *, heartbeat_sec: float = 1.5) -> list[tuple[str, str]]:
+    """
+    Собирает (cloud_path, local_path) для всех _SELFIE*.jpg (со структурой подпапок).
+    Периодически логирует прогресс сканирования (heartbeat).
+    """
+    tasks: list[tuple[str, str]] = []
+    os.makedirs(local_root, exist_ok=True)
+
+    counts = {"dirs": 0, "files": 0, "selfies": 0}
+    last_log = time.time()
+
+    def maybe_log(force: bool = False) -> None:
+        nonlocal last_log
+        now = time.time()
+        if force or (now - last_log) >= heartbeat_sec:
+            logger.info(f"Сканирую облако… папок: {counts['dirs']}, файлов просмотрено: {counts['files']}, найдено селфи: {counts['selfies']}")
+            last_log = now
+
+    def walk(cloud_dir: str, rel_local: str = "") -> None:
+        counts["dirs"] += 1
+        try:
+            items = list(disk.listdir(cloud_dir))
+        except Exception as e:
+            logger.warning(f"Я.Диск: не удалось прочитать {cloud_dir}: {e}")
+            return
+
+        for item in items:
+            name = item.name
+            if item.type == "dir":
+                walk(item.path, os.path.join(rel_local, name))
+            elif item.type == "file":
+                counts["files"] += 1
+                if name.startswith("_SELFIE") and name.lower().endswith(".jpg"):
+                    local_path = os.path.join(local_root, rel_local, name)
+                    tasks.append((item.path, local_path))
+                    counts["selfies"] += 1
+            # heartbeat
+            maybe_log()
+
+    logger.info(f"Сканирую облако: {cloud_root}")
+    walk(cloud_root, "")
+    maybe_log(force=True)
+    return tasks
 
 
-def find_selfie_files(folder_path):
-    """Находит все файлы _SELFIE* в папке."""
-    selfies = [f for f in os.listdir(folder_path) if f.startswith("_SELFIE") and f.endswith(".jpg")]
-    selfies.sort(key=lambda x: datetime.strptime(f"{x.split('_')[3]}_{x.split('_')[4]}", "%y%m%d_%H%M%S"))
-    return selfies
+_DL_DISK = None  # глобал для воркера скачивания
 
+def _dl_init(token: str):
+    global _DL_DISK
+    _DL_DISK = YaDisk(token=token)
 
-def match_photo(photo_path, selfie_encodings, threshold, resize=False):
-    """Сравнивает лицо на фотографии с эмбеддингами селфи."""
-    photo_encodings = get_face_encoding(photo_path, check_quality=check_q, resize=resize)  # Проверяем качество и применяем ресайз
-    for photo_encoding in photo_encodings:
-        matches = face_recognition.compare_faces(selfie_encodings, photo_encoding, tolerance=threshold)
-        if True in matches:
-            return photo_path
+def _dl_one(task: tuple[str, str]) -> str | None:
+    """Скачивает один файл; с ретраями/backoff на 429/5xx."""
+    cloud_file, local_file = task
+    for attempt in range(5):
+        try:
+            os.makedirs(os.path.dirname(local_file), exist_ok=True)
+            with open(local_file, "wb") as f:
+                _DL_DISK.download(cloud_file, f)
+            return local_file
+        except Exception as e:
+            msg = str(e)
+            if attempt < 4 and any(x in msg for x in ("429", "Rate", "Too Many", "temporar", " 5")):
+                time.sleep(1.0 * (2**attempt) + random.random())
+                continue
+            logging.getLogger("recognition").error(f"Я.Диск: ошибка скачивания {cloud_file} -> {local_file}: {e}")
+            return None
     return None
 
+def download_yadisk_selfies_parallel(
+    token: str,
+    cloud_root: str,
+    local_root: str,
+    *,
+    max_procs: int | None = None
+) -> int:
+    """
+    Параллельно скачивает все _SELFIE*.jpg из cloud_root в local_root.
+    Возвращает число успешно скачанных файлов.
+    Зависимости: collect_selfie_files(), _dl_init(), _dl_one(), logger, get_context, cpu_count.
+    """
+    # 1) Собираем задания (heartbeat логика внутри collect_selfie_files)
+    disk = YaDisk(token=token)  # один клиент для обхода дерева
+    tasks = collect_selfie_files(disk, cloud_root, local_root)
+    total = len(tasks)
+    logger.info(f"Найдено селфи к скачиванию: {total} шт. Из {cloud_root}")
+    if total == 0:
+        return 0
 
-def find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold=threshold, resize=resize):
-    """Находит совпадения фотографий с использованием параллельной обработки."""
-    photo_paths = [os.path.join(all_photos_folder, f) for f in os.listdir(all_photos_folder) if f.endswith('.jpg')]
+    # 2) Готовим пул процессов
+    ctx = get_context("spawn")
+    nproc = min(max_procs or min(8, cpu_count()), 16)
+    # разумный chunksize для коротких задач
+    chunks = max(1, total // max(nproc * 8, 1))
 
-    with Pool(cpu_count()) as pool:
-        results = pool.starmap(match_photo, [(path, selfie_encodings, threshold, resize) for path in photo_paths])
+    # 3) Качаем с прогрессом и ETA
+    done_ok = 0
+    done_total = 0
+    t0 = time.time()
+    last = t0
+    with ctx.Pool(processes=nproc, initializer=_dl_init, initargs=(token,)) as pool:
+        for res in pool.imap_unordered(_dl_one, tasks, chunksize=chunks):
+            done_total += 1
+            if res:
+                done_ok += 1
 
-    matching_photos = [result for result in results if result]
-    logger.info(f"Найдено совпадений: {len(matching_photos)}")
-    return matching_photos
+            now = time.time()
+            if now - last >= 1.0:  # heartbeat ~раз в секунду
+                elapsed = now - t0
+                rate = done_total / elapsed if elapsed > 0 else 0.0   # файлов/сек
+                remain = total - done_total
+                eta_sec = int(remain / rate) if rate > 0 else -1
+                logger.info(
+                    f"Скачивание: ok {done_ok}/{total}, обработано {done_total}/{total}, "
+                    f"скорость ~{rate:.1f} ф/с, ETA ~{eta_sec} с"
+                )
+                last = now
 
+    logger.info(f"Скачано селфи: {done_ok}/{total} за {round(time.time() - t0)} сек.")
+    return done_ok
 
-def copy_photos_to_selfie_folder(matching_photos, target_folder):
-    """Копирует фотографии в папку с _SELFIE*."""
-    for photo in matching_photos:
-        shutil.copy(photo, target_folder)
-        logger.info(f"Скопировано: {photo} -> {target_folder}")
+def upload_yadisk_folder(disk: YaDisk, local_path: str, cloud_path: str) -> None:
+    """Рекурсивная загрузка, пропуская _SELFIE*.jpg (их не заливаем)."""
+    try:
+        try:
+            disk.mkdir(cloud_path)
+        except PathExistsError:
+            logger.info(f"Папка уже есть: {cloud_path}")
+        for name in os.listdir(local_path):
+            lp = os.path.join(local_path, name)
+            cp = ypath_join(cloud_path, name)
+            if name.startswith("_SELFIE") and name.lower().endswith(".jpg"):
+                continue
+            if os.path.isdir(lp):
+                upload_yadisk_folder(disk, lp, cp)
+            elif os.path.isfile(lp):
+                try:
+                    disk.upload(lp, cp, overwrite=False)
+                    logger.info(f"↑ {lp} -> {cp}")
+                except PathExistsError:
+                    logger.info(f"Файл существует: {cp}")
+    except Exception as e:
+        logger.error(f"Я.Диск: ошибка загрузки {local_path}: {e}")
 
+def process_folder_upload(token: str, selfie_root_local: str, cloud_root: str, folder_name: str) -> None:
+    """Для пула: загрузка одной локальной папки на Я.Диск."""
+    disk = YaDisk(token=token)
+    local_folder = os.path.join(selfie_root_local, folder_name)
+    cloud_path = ypath_join(cloud_root, os.path.basename(selfie_root_local), folder_name)
+    upload_yadisk_folder(disk, local_folder, cloud_path)
 
-def process_selfie_files(folder_path, all_photos_folder, threshold, resize=False):
-    """Обрабатывает все _SELFIE* файлы в папке."""
+# ----------------------- Источники (интерактив/CLI) -----------------------
+
+def _normalize_user_path(raw: str) -> str:
+    """Нормализуем пользовательский ввод пути: снимаем кавычки, \\  -> пробел, ~, //, .."""
+    s = raw.strip()
+    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+        s = s[1:-1]
+    try:
+        parts = shlex.split(s)
+        if len(parts) == 1:
+            s = parts[0]
+    except Exception:
+        s = s.replace("\\ ", " ")
+    s = os.path.expanduser(s)
+    s = os.path.normpath(s)
+    return s
+
+def choose_all_photos_source(default_path: str) -> str | None:
+    logger.info(f"Введите путь к папке отчёта (Enter — {default_path}):")
+    raw = input("Путь: ")
+    path = raw.strip()
+    if not path:
+        path = default_path
+    else:
+        path = _normalize_user_path(path)
+
+    logger.info(f"Выбран путь: {path}")
+    if os.path.isdir(path):
+        logger.info(f"Отчёт: {path}")
+        return path
+
+    if os.path.isfile(path):  # если дали файл — возьмём родителя
+        parent = os.path.dirname(path)
+        if os.path.isdir(parent):
+            logger.info(f"Дан файл, беру папку: {parent}")
+            return parent
+
+    logger.error("Нет такой папки.")
+    return None
+
+def choose_selfie_source(disk: YaDisk, root_cloud: str, local_default: str, max_procs: int | None = None) -> str | None:
+    folders = list_yadisk_folders(disk, root_cloud)
+    print("")
+    logger.info("Источник селфи:")
+    logger.info(f"0: локально ({local_default})")
+    if folders:
+        for i, name in enumerate(folders, 1):
+            logger.info(f"{i}: {name}")
+    choice = input("Ваш выбор (0 — локально, 1..N — Я.Диск, либо путь): ").strip()
+
+    # свободный путь
+    if choice and not choice.isdigit():
+        path = _normalize_user_path(choice)
+        if os.path.isdir(path):
+            logger.info(f"Локально: {path}")
+            return path
+        logger.error("Указанный путь к селфи не существует.")
+        return None
+
+    if choice == "0" or choice == "":
+        path = _normalize_user_path(local_default)
+        logger.info(f"Локально: {path}")
+        return path
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(folders):
+            selected = folders[idx]
+            local_path = os.path.join(images_root, selected)
+            cloud_path = ypath_join(root_cloud, selected)
+            # Параллельная загрузка _SELFIE*.jpg
+            download_yadisk_selfies_parallel(yadisk_token, cloud_path, local_path, max_procs=max_procs)
+            return local_path
+    except ValueError:
+        pass
+
+    logger.error("Неверный выбор.")
+    return None
+
+# ----------------------- Сканирование фотоотчёта -----------------------
+
+def scan_jpgs(path: str) -> list[str]:
+    """Сканируем только изображения; фильтруем скрытые и AppleDouble."""
+    exts = ('.jpg', '.jpeg', '.heic', '.heif')  # HEIC/HEIF при наличии pillow-heif
+    out: list[str] = []
+    with os.scandir(path) as it:
+        for e in it:
+            if not e.is_file():
+                continue
+            name = e.name
+            if name.startswith('.') or name.startswith('._'):
+                continue
+            if name.lower().endswith(exts):
+                out.append(e.path)
+    return out
+
+# ----------------------- Прогрев кеша -----------------------
+
+def build_photo_encoding_cache(photo_paths: list[str], *, do_resize: bool, workers: int, chunks: int) -> dict[str, list[np.ndarray]]:
+    """Предзагрузка кеша эмбеддингов для отчёта (параллельно)."""
+    logger.info(f"Грею кеш эмбеддингов для {len(photo_paths)} фото…")
+    t0 = time.time()
+    ctx = get_context("spawn")
+    nproc = max(1, min(workers, 16))
+    chunk_size = max(1, chunks) if chunks and chunks > 0 else max(1, len(photo_paths) // (nproc * 4) or 1)
+
+    def _enc(path: str) -> tuple[str, list[np.ndarray]]:
+        return path, load_encodings_for_image(path, check_quality=check_q, do_resize=do_resize)
+
+    results: dict[str, list[np.ndarray]] = {}
+    with ctx.Pool(processes=nproc) as pool:
+        for path, encs in pool.imap_unordered(_enc, photo_paths, chunksize=chunk_size):
+            results[path] = encs
+    logger.info(f"Кеш готов за {round(time.time() - t0)} сек.")
+    return results
+
+# ----------------------- Быстрые матричные расстояния -----------------------
+
+def min_l2_dist_mat(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """
+    Для каждой строки A считает минимум L2 до любой строки B.
+    A: (M,128) float32, B: (N,128) float32 -> (M,)
+    """
+    if A.size == 0:
+        return np.full((0,), np.inf, dtype=np.float32)
+    if B.size == 0:
+        return np.full((A.shape[0],), np.inf, dtype=np.float32)
+    A = A.astype(np.float32, copy=False)
+    B = B.astype(np.float32, copy=False)
+    aa = np.sum(A*A, axis=1, keepdims=True)    # (M,1)
+    bb = np.sum(B*B, axis=1, keepdims=True).T  # (1,N)
+    prod = A @ B.T                             # (M,N)
+    d2 = aa + bb - 2.0 * prod
+    np.maximum(d2, 0.0, out=d2)
+    return np.sqrt(np.min(d2, axis=1))
+
+# ----------------------- Параллельный матчинг -----------------------
+
+_WORKER_SELFIE_ENCS: np.ndarray | None = None
+_WORKER_THRESHOLD: float | None = None
+_WORKER_RESIZE: bool | None = None
+_WORKER_CHECKQ: bool | None = None
+
+def _worker_init(selfie_encs: np.ndarray, threshold_v: float, resize_flag: bool, checkq_flag: bool):
+    global _WORKER_SELFIE_ENCS, _WORKER_THRESHOLD, _WORKER_RESIZE, _WORKER_CHECKQ
+    _WORKER_SELFIE_ENCS = selfie_encs.astype(np.float32, copy=False)
+    _WORKER_THRESHOLD = float(threshold_v)
+    _WORKER_RESIZE = bool(resize_flag)
+    _WORKER_CHECKQ = bool(checkq_flag)
+
+def _match_photo_worker(photo_path: str) -> str | None:
+    try:
+        encs = load_encodings_for_image(photo_path, check_quality=_WORKER_CHECKQ, do_resize=_WORKER_RESIZE)
+    except Exception as e:
+        logging.getLogger("recognition").warning(f"Worker skip {photo_path}: {e}")
+        return None
+
+    if not encs or _WORKER_SELFIE_ENCS is None or _WORKER_THRESHOLD is None:
+        return None
+
+    E = np.asarray(encs, dtype=np.float32)  # (K,128)
+    dmins = min_l2_dist_mat(E, _WORKER_SELFIE_ENCS)
+    if dmins.size and float(np.min(dmins)) <= float(_WORKER_THRESHOLD):
+        return photo_path
+    return None
+
+def process_selfie_folder(folder_path: str,
+                          all_photo_paths: list[str],
+                          preload_cache: dict[str, list[np.ndarray]] | None,
+                          *, threshold_v: float,
+                          resize_flag: bool,
+                          workers: int,
+                          chunks: int,
+                          dry_run: bool,
+                          do_move: bool,
+                          hardlink: bool) -> tuple[int, int, bool, set[str]]:
+    """
+    Обрабатывает одну папку селфи.
+    Возврат: (кол-во _SELFIE, скопировано, найдены_лица, set путей-матчей).
+    """
     selfies = find_selfie_files(folder_path)
-    selfie_count = len(selfies)
+    if not selfies:
+        logger.info(f"Нет _SELFIE*.jpg в {folder_path}")
+        return 0, 0, False, set()
 
-    if selfie_count == 0:
-        logger.info(f"В папке {folder_path} нет файлов _SELFIE*")
-        return selfie_count, 0, False
-    
-    total_copied = 0
-    found_faces = False
+    # Собираем все эмбеддинги селфи
+    all_selfie_encs: list[np.ndarray] = []
+    for sf in selfies:
+        sp = os.path.join(folder_path, sf)
+        encs = load_encodings_for_image(sp, check_quality=False, do_resize=resize_flag)
+        all_selfie_encs.extend(encs)
 
-    for selfie_file in selfies:
-        selfie_path = os.path.join(folder_path, selfie_file)
-        logger.info(f"Обрабатываю _SELFIE файл: {selfie_path}")
-        
-        # Получаем эмбеддинги лиц на _SELFIE*, без проверки качества
-        selfie_encodings = get_face_encoding(selfie_path, check_quality=False, resize=resize)
-        
-        if selfie_encodings is None or len(selfie_encodings) == 0:
-            logger.warning(f"Не найдено лиц на изображении: {selfie_path}")
+    if not all_selfie_encs:
+        logger.warning(f"В {folder_path} лица не найдены.")
+        return len(selfies), 0, False, set()
+
+    selfie_mat = np.asarray(all_selfie_encs, dtype=np.float32)  # (S,128)
+
+    # Параллельный матчинг
+    ctx = get_context("spawn")
+    nproc = max(1, min(workers, 16))
+    chunk_size = max(1, chunks) if chunks and chunks > 0 else max(1, len(all_photo_paths) // (nproc * 8) or 1)
+
+    match_paths: List[str | None] = []
+    if preload_cache is not None:
+        for p in all_photo_paths:
+            encs = preload_cache.get(p, [])
+            if encs:
+                E = np.asarray(encs, dtype=np.float32)
+                dmin = float(np.min(min_l2_dist_mat(E, selfie_mat)))
+                if dmin <= threshold_v:
+                    match_paths.append(p)
+                    continue
+            match_paths.append(None)
+    else:
+        with ctx.Pool(processes=nproc,
+                      initializer=_worker_init,
+                      initargs=(selfie_mat, threshold_v, resize_flag, check_q)) as pool:
+            for res in pool.imap_unordered(_match_photo_worker, all_photo_paths, chunksize=chunk_size):
+                match_paths.append(res)
+
+    # Копирование/линк/перемещение
+    matches = {p for p in match_paths if p}
+    copied = 0
+    for mp in matches:
+        dst = os.path.join(folder_path, os.path.basename(mp))
+        if os.path.exists(dst):
             continue
-        
-        found_faces = True
+        if dry_run:
+            logger.info(f"[DRY-RUN] Скопировал бы: {mp} -> {folder_path}")
+            copied += 1
+            continue
+        try:
+            if hardlink:
+                os.link(mp, dst)
+            elif do_move:
+                shutil.move(mp, dst)
+            else:
+                shutil.copy2(mp, dst)
+            copied += 1
+            logger.info(f"Скопировано: {mp} -> {folder_path}")
+        except OSError:
+            shutil.copy2(mp, dst)
+            copied += 1
+            logger.info(f"Скопировано (fallback): {mp} -> {folder_path}")
 
-        # Находим совпадающие фотографии в @all_photos параллельно
-        matching_photos = find_matching_faces_parallel(selfie_encodings, all_photos_folder, threshold, resize)
-        
-        # Копируем найденные фотографии в папку с _SELFIE*
-        if matching_photos:
-            copy_photos_to_selfie_folder(matching_photos, folder_path)
-            total_copied += len(matching_photos)
-            logger.info(f"Для {selfie_file} найдено {len(matching_photos)} совпадений.")
-        else:
-            logger.info(f"Для {selfie_file} совпадений не найдено.")
-    
-    return selfie_count, total_copied, found_faces
+    return len(selfies), copied, True, matches
 
+# ----------------------- Отчёты -----------------------
+
+def _save_report_json(path: str, data: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def _save_report_csv(path: str, rows: list[tuple[str, str]]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["selfie_folder", "matched_photo"])
+        w.writerows(rows)
+
+# ----------------------- Main -----------------------
 
 def main():
-    # Выбор источника всех фоток
-    all_photos_folder = choose_all_photos_source()
-    if not all_photos_folder:
-        logger.error("Не удалось выбрать источник всего фотоотчёта.")
+    parser = argparse.ArgumentParser(description="Fast selfie matcher (face_recognition).")
+    parser.add_argument("--all-photos", type=str, default=None, help="Путь к полному фотоотчёту (папка).")
+    parser.add_argument("--selfies", type=str, default=None, help="Путь к папке селфи (локально).")
+    parser.add_argument("--from-cloud", action="store_true", help="Выбрать селфи из Я.Диска (интерактив).")
+    parser.add_argument("--no-upload", action="store_true", help="Не загружать результат обратно на Я.Диск.")
+    parser.add_argument("--preload", choices=["auto", "on", "off"], default="auto",
+                        help="Режим прогрева кеша эмбеддингов: auto|on|off (по умолчанию auto).")
+    parser.add_argument("--preload-cache", action="store_true",
+                        help="(deprecated) Синоним --preload on.")    
+    parser.add_argument("--resize", dest="resize", action="store_true", default=resize_enabled, help="Включить ресайз.")
+    parser.add_argument("--dry-run", action="store_true", help="Не писать файлы, только логи.")
+    parser.add_argument("--move", action="store_true", help="Перемещать вместо копирования.")
+    parser.add_argument("--hardlink", action="store_true", help="Жёсткие ссылки вместо копирования (одна ФС).")
+    parser.add_argument("--workers", type=int, default=min(8, cpu_count()), help="Кол-во процессов для матчинга/IO.")
+    parser.add_argument("--chunks", type=int, default=0, help="Размер чанка для imap_unordered (0 = авто).")
+    args = parser.parse_args()
+
+    # back-compat с --preload-cache
+    if args.preload_cache:
+        args.preload = "on"
+
+    if not yadisk_token:
+        logger.warning("Токен Я.Диск пуст. Загрузка/скачивание работать не будут, если они нужны.")
+
+    disk = YaDisk(token=yadisk_token) if yadisk_token else None
+
+    # Источник отчёта
+    all_photos_folder = args.all_photos or all_photos_default
+    if not args.all_photos:
+        all_photos_folder = choose_all_photos_source(all_photos_folder)
+        if not all_photos_folder:
+            logger.error("Не выбран источник полного отчёта.")
+            return
+    if not os.path.isdir(all_photos_folder):
+        logger.error(f"Нет папки отчёта: {all_photos_folder}")
         return
-    # Начинаем считать время на скачивание с Яндекс.Диск
-    start_download_time = time.time()
- 
-    # Выбор источника селфи
-    selfie_folder = choose_selfie_source()
-    if not selfie_folder:
-        logger.error("Не удалось выбрать источник селфи.")
-        return
-    
-    end_download_time = time.time()
-    download_elapsed_time = round(end_download_time - start_download_time)
 
-    selfie_folders = [f for f in os.listdir(selfie_folder) if os.path.isdir(os.path.join(selfie_folder, f)) and f != all_photos_folder]
-    total_selfie_folders = len(selfie_folders)
-    total_all_photos = len([f for f in os.listdir(all_photos_folder) if f.endswith('.jpg')])
-
-    # Начинаем считать время на распознавание
-    start_time = time.time()
-
-    logger.info(f"Всего папок с селфи: {total_selfie_folders}")
-    logger.info(f"Всего фотографий в отчёте: {total_all_photos}")
-
-    total_selfies = 0
-    total_copied_photos = 0
-    no_faces_folders = []
-
-    for folder_name in selfie_folders:
-        folder_path = os.path.join(selfie_folder, folder_name)
-        logger.info(f"Обрабатываю папку: {folder_path}")
-
-        # Обрабатываем все _SELFIE* файлы в текущей папке
-        selfie_count, copied_count, found_faces = process_selfie_files(folder_path, all_photos_folder, threshold, resize=resize)
-        total_selfies += selfie_count
-        total_copied_photos += copied_count
-
-        if not found_faces:
-            no_faces_folders.append(folder_name)
-
-    end_time = time.time()
-    elapsed_time = round(end_time - start_time)
-
-    print(" ")
-    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}")
-    logger.info(f"Обработано селфи: {total_selfies}")
-    logger.info(f"Скопировано файлов: {total_copied_photos}")
-    logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}")
-    print(" ")
-
-    # Попросим пользователя нажать Enter для начала загрузки, либо ввести что-то для выхода
-    user_input = input("Нажми Enter для загрузки распознанных фото на Яндекс.Диск, или введи что-то для выхода: ").strip()
-
-    if user_input == "":
-        # Начинаем считать время на загрузку
-        start_upload_time = time.time()
-   
-        # Получаем токен из объекта disk
-        token = disk.token
-        
-        # Создаем частичную функцию с токеном вместо объекта disk
-        process_folder_partial = partial(process_folder, token, selfie_folder, cloud_selfies)
-        
-        # Определяем количество процессов
-        num_processes = min(8, cpu_count())
-        
-        # Создаем пул процессов и запускаем параллельную обработку
-        with Pool(num_processes) as pool:
-            pool.map(process_folder_partial, selfie_folders)
-
-        end_upload_time = time.time()
-        upload_elapsed_time = round(end_upload_time - start_upload_time)
-        
-        logger.info("Загрузка найденных фотографий на Яндекс.Диск завершена.")
+    # Источник селфи
+    if args.selfies:
+        selfie_root = args.selfies
+    elif args.from_cloud:
+        if not disk:
+            logger.error("Нет токена Я.Диск. Невозможно выбрать из облака.")
+            return
+        selfie_root = choose_selfie_source(disk, cloud_selfies_root, selfies_default, max_procs=args.workers)
     else:
-        logger.info("Выход из программы.")
+        selfie_root = selfies_default
+        logger.info(f"Источник селфи: {selfie_root}")
+    if not selfie_root or not os.path.isdir(selfie_root):
+        logger.error("Некорректный путь к селфи.")
         return
 
-    # Итоговая информация
-    print(" ")
-    logger.info(f"Всего папок с селфи: {total_selfie_folders}, фотографий в отчёте: {total_all_photos}.")
-    logger.info(f"Обработано селфи: {total_selfies}.")
-    logger.info(f"Скопировано файлов: {total_copied_photos}.")
-    logger.info(f"Папки без найденных лиц: {', '.join(no_faces_folders) if no_faces_folders else 'нет'}.")
-    logger.info(f"Время распознавания: {elapsed_time} секунд.")
-    logger.info(f"Общее время скачивания: {download_elapsed_time} секунд.")
-    logger.info(f"Общее время загрузки: {upload_elapsed_time} секунд.")
-    print(" ")
+    # Список подпапок селфи
+    selfie_folders = [f for f in os.listdir(selfie_root)
+                      if os.path.isdir(os.path.join(selfie_root, f))]
+    total_selfie_folders = len(selfie_folders)
 
+    all_photo_paths = scan_jpgs(all_photos_folder)
+    total_all_photos = len(all_photo_paths)
+
+    logger.info(f"Папок с селфи: {total_selfie_folders}")
+    logger.info(f"Фото в отчёте: {total_all_photos}")
+
+    # Решение про прогрев кеша
+    preload_mode = args.preload
+    auto_should_preload = (total_selfie_folders > 20 and total_all_photos > 200)
+    do_preload = (preload_mode == "on") or (preload_mode == "auto" and auto_should_preload)
+
+    logger.info(f"Preload cache: {'ON' if do_preload else 'OFF'} "
+                f"(mode={preload_mode}, guests={total_selfie_folders}, photos={total_all_photos})")
+
+    preload = build_photo_encoding_cache(
+        all_photo_paths, do_resize=args.resize, workers=args.workers, chunks=args.chunks
+    ) if do_preload else None
+
+    # Распознавание
+    t0 = time.time()
+    total_selfies = 0
+    total_copied = 0
+    no_faces: list[str] = []
+    report_rows: list[tuple[str, str]] = []
+
+    for fname in selfie_folders:
+        fpath = os.path.join(selfie_root, fname)
+        logger.info(f"== Обработка папки: {fpath}")
+        scount, copied, found, matches = process_selfie_folder(
+            fpath, all_photo_paths, preload,
+            threshold_v=threshold_val, resize_flag=args.resize,
+            workers=args.workers, chunks=args.chunks,
+            dry_run=args.dry_run, do_move=args.move, hardlink=args.hardlink
+        )
+        total_selfies += scount
+        total_copied += copied
+        if not found:
+            no_faces.append(fname)
+        for mp in matches:
+            report_rows.append((fname, mp))
+
+    elapsed = round(time.time() - t0)
+
+    # Итоги + отчёты
+    print("")
+    logger.info(f"ИТОГО: папок селфи={total_selfie_folders}, фото в отчёте={total_all_photos}")
+    logger.info(f"Обработано селфи={total_selfies}")
+    logger.info(f"Скопировано файлов={total_copied}")
+    logger.info(f"Папки без лиц: {', '.join(no_faces) if no_faces else 'нет'}")
+    logger.info(f"Время распознавания: {elapsed} сек.")
+    print("")
+
+    try:
+        _save_report_json("report.json", {
+            "selfie_folders": total_selfie_folders,
+            "photos": total_all_photos,
+            "selfies_processed": total_selfies,
+            "copied": total_copied,
+            "no_faces": no_faces,
+            "elapsed_sec": elapsed,
+            "dry_run": args.dry_run,
+            "move": args.move,
+            "hardlink": args.hardlink,
+        })
+        _save_report_csv("report.csv", report_rows)
+        logger.info("Отчёты сохранены: report.json, report.csv")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить отчёты: {e}")
+
+    # Загрузка на Я.Диск (по Enter)
+    if args.no_upload:
+        logger.info("Загрузка пропущена (--no-upload).")
+        return
+
+    if not yadisk_token:
+        logger.warning("Нет токена Я.Диск. Пропускаю загрузку.")
+        return
+
+    user_input = input("Нажми Enter для загрузки на Яндекс.Диск, или введи что-то для выхода: ").strip()
+    if user_input != "":
+        logger.info("Выход без загрузки.")
+        return
+
+    t_up0 = time.time()
+    token = yadisk_token
+    process_partial = partial(process_folder_upload, token, selfie_root, cloud_selfies_root)
+    nproc = min(8, cpu_count())
+    with Pool(nproc) as pool:
+        pool.map(process_partial, selfie_folders)
+    t_up = round(time.time() - t_up0)
+
+    print("")
+    logger.info("Загрузка завершена.")
+    logger.info(f"Время загрузки: {t_up} сек.")
+    print("")
 
 if __name__ == "__main__":
     main()

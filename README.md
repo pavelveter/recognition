@@ -12,17 +12,6 @@ This project automatically matches guests' selfies with event photos.
 This module was originally developed by me in 2024–2025 as part of the SelfieBot project.  
 Этот модуль был разработан мной в 2024–2025 как часть проекта SelfieBot.
 
-At some point, the code was stolen and used without attribution.  
-В какой-то момент код был украден и использовался без указания авторства.
-
-To make sure it remains free and cannot be locked behind closed doors,  
-I decided to publish it under the GPLv3 license.  
-Чтобы он навсегда остался свободным и не оказался закрыт в чьих-то руках,  
-я решил выложить его под лицензией GPLv3.
-
-Now anyone can use it, extend it and contribute — but only under the same terms of freedom.  
-Теперь любой может пользоваться, дорабатывать и вносить вклад — но только в рамках тех же условий свободы.
-
 ## Features / Возможности
 
 - Detects and encodes faces in `_SELFIE*.jpg` photos.  
